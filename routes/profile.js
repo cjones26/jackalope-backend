@@ -5,10 +5,6 @@ import Profile from '../models/profile.js';
 
 const router = express.Router();
 
-// Get the pixel size equivalent of Tailwind's h-24/w-24 classes
-// h-24 and w-24 in Tailwind are 6rem, which is typically 96px (6 × 16px)
-const AVATAR_SIZE = 96;
-
 // Configure multer for memory storage
 const storage = multer.memoryStorage();
 const upload = multer({
@@ -70,10 +66,9 @@ router.post('/', upload.single('profileImage'), async (req, res) => {
         resource_type: 'image',
         transformation: [
           {
-            width: AVATAR_SIZE,
-            height: AVATAR_SIZE,
+            aspect_ratio: '1:1',
             crop: 'fill',
-            gravity: 'face',
+            gravity: 'auto:faces',
           },
         ],
       });
