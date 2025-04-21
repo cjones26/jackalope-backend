@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import connectDatabase from './services/db.js';
 import authMiddleware from './middleware/auth.js';
 import profileRoutes from './routes/profile.js';
+import galleryRoutes from './routes/gallery.js';
 
 dotenv.config();
 
@@ -29,5 +30,7 @@ app.get('/', authMiddleware, (req, res) => {
 });
 
 app.use('/profile', authMiddleware, profileRoutes);
+
+app.use('/gallery', authMiddleware, galleryRoutes);
 
 app.listen(8080, () => console.log('Server is running on port 8080'));
