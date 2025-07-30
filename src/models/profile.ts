@@ -1,7 +1,8 @@
-import mongoose from 'mongoose';
+import mongoose, { Schema } from 'mongoose';
+import { IProfile } from '../types';
 
 // Define the Profile schema
-const profileSchema = new mongoose.Schema(
+const profileSchema = new Schema<IProfile>(
   {
     userId: {
       type: String,
@@ -22,4 +23,4 @@ const profileSchema = new mongoose.Schema(
 );
 
 // Create the Profile model
-export default mongoose.model('Profile', profileSchema);
+export default mongoose.model<IProfile>('Profile', profileSchema);

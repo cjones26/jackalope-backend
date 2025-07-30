@@ -1,15 +1,15 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import connectDatabase from './services/db.js';
-import authMiddleware from './middleware/auth.js';
-import profileRoutes from './routes/profile.js';
-import galleryRoutes from './routes/gallery.js';
+import connectDatabase from '@/services/db';
+import authMiddleware from '@/middleware/auth';
+import profileRoutes from '@/routes/profile';
+import galleryRoutes from '@/routes/gallery';
 
 dotenv.config();
 
 // Get the secret from environment variables
-const hmacSecret = process.env.SUPABASE_JWT_SECRET;
+const hmacSecret: string | undefined = process.env.SUPABASE_JWT_SECRET;
 
 // Prevent the server from starting if the secret is not set
 if (!hmacSecret) {
@@ -30,7 +30,7 @@ app.use(
   })
 );
 
-app.get('/', authMiddleware, (req, res) => {
+app.get('/', authMiddleware, (req: Request, res: Response) => {
   res.send('Welcome to the backend');
 });
 
@@ -38,4 +38,6 @@ app.use('/profile', authMiddleware, profileRoutes);
 
 app.use('/gallery', authMiddleware, galleryRoutes);
 
-app.listen(8080, () => console.log('Server is running on port 8080'));
+const PORT = process.env.PORT || 8080;
+
+app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));

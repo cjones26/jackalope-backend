@@ -1,6 +1,7 @@
-import mongoose from 'mongoose';
+import mongoose, { Schema } from 'mongoose';
+import { IGallery } from '../types';
 
-const gallerySchema = new mongoose.Schema(
+const gallerySchema = new Schema<IGallery>(
   {
     userId: {
       type: String,
@@ -64,10 +65,10 @@ gallerySchema.index({ userId: 1, title: 1 });
 gallerySchema.index({ userId: 1, tags: 1 });
 
 // Virtual for thumbnail URL
-gallerySchema.virtual('thumbnailUrl').get(function () {
+gallerySchema.virtual('thumbnailUrl').get(function (this: IGallery) {
   return null; // This will be set dynamically in the route handler
 });
 
-const Gallery = mongoose.model('Gallery', gallerySchema);
+const Gallery = mongoose.model<IGallery>('Gallery', gallerySchema);
 
 export default Gallery;
