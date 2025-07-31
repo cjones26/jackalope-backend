@@ -1,28 +1,4 @@
-import { Request } from 'express';
 import { Document } from 'mongoose';
-
-// User interface from JWT token
-export interface User {
-  id: string;
-  email: string;
-}
-
-// Extended Request interface with user and file(s)
-export interface AuthenticatedRequest extends Request {
-  user: User;
-  file?: Express.Multer.File;
-  files?: Express.Multer.File[];
-  galleryImage?: IGallery;
-}
-
-// Profile interface
-export interface IProfile extends Document {
-  userId: string;
-  email: string;
-  first_name?: string;
-  last_name?: string;
-  profile_image?: string;
-}
 
 // Gallery interface
 export interface IGallery extends Document {
@@ -37,6 +13,8 @@ export interface IGallery extends Document {
   height: number;
   url: string;
   uploadedAt: Date;
+  createdAt: Date;
+  updatedAt: Date;
   thumbnailUrl?: string;
 }
 
@@ -81,4 +59,10 @@ export interface GalleryResponse {
   currentPage: number;
   totalPages: number;
   hasMore: boolean;
+}
+
+export interface JWTPayload {
+  sub: string;
+  email: string;
+  [key: string]: any;
 }
