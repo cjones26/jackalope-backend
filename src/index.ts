@@ -1,82 +1,73 @@
 import Fastify from 'fastify';
-import cors from '@fastify/cors';
-import multipart from '@fastify/multipart';
-import fastifyJwt, { JWT } from '@fastify/jwt';
 import dotenv from 'dotenv';
-import connectDatabase from './services/db';
-import galleryRoutes from '@/routes/gallery';
-import { JWTPayload } from '@/types';
-import { FastifyRequest } from 'fastify';
-import { FastifyReply } from 'fastify';
+import connectDatabase from '@/services/db';
+import globalErrorHandler from '@/utils/globalErrorHandler';
+import registerPlugins from '@/utils/registerPlugins';
+import companion from '@uppy/companion';
+import fastifyExpress from '@fastify/express';
 
 dotenv.config();
 
-// Get the secret from environment variables
-const hmacSecret: string | undefined = process.env.SUPABASE_JWT_SECRET;
-
 // Create Fastify instance
 const fastify = Fastify({
-  logger: true,
+  logger: {
+    level: 'info',
+    transport: {
+      target: 'pino-pretty',
+      options: {
+        translateTime: 'HH:MM:ss Z',
+        ignore: 'pid,hostname',
+      },
+    },
+  },
 });
 
 connectDatabase();
 
-// Register plugins
-async function registerPlugins() {
-  // Register CORS
-  await fastify.register(cors, {
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  });
-
-  // Register multipart for file uploads
-  await fastify.register(multipart, {
-    limits: {
-      fileSize: 10 * 1024 * 1024, // 10MB limit
+// Companion configuration
+const companionOptions = {
+  providerOptions: {
+    s3: {
+      getKey: (req: any, filename: string, metadata: any) => {
+        const userId = req.headers['x-user-id'];
+        const timestamp = Date.now();
+        const sanitizedFilename = filename.replace(/[^a-zA-Z0-9.-]/g, '_');
+        return `temp-uploads/${userId}/${timestamp}-${sanitizedFilename}`;
+      },
+      key: process.env.AWS_ACCESS_KEY_ID,
+      secret: process.env.AWS_SECRET_ACCESS_KEY,
+      bucket: process.env.S3_TEMP_BUCKET,
+      region: process.env.AWS_REGION,
+      expires: 3600, // 1 hour expiry for presigned URLs
+      acl: 'private',
     },
-  });
+  },
+  server: {
+    host: `localhost:${process.env.PORT || 3000}`,
+    protocol: process.env.NODE_ENV === 'production' ? 'https' : 'http',
+    path: '/s3',
+  },
+  filePath: './tmp',
+  secret: process.env.COMPANION_SECRET,
+  debug: process.env.NODE_ENV !== 'production',
+  logClientVersion: false,
+  allowLocalUrls: process.env.NODE_ENV !== 'production',
+};
 
-  // Prevent the server from starting if the secret is not set
-  if (!hmacSecret) {
-    console.error('Please set the SUPABASE_JWT_SECRET environment variable');
-    process.exit(1);
-  }
-
-  // Register @fastify/auth plugin
-  await fastify.register(fastifyJwt, {
-    secret: hmacSecret,
-    formatUser: (payload: JWTPayload) => {
-      return {
-        id: payload.sub,
-        email: payload.email,
-      };
-    },
-  });
-
-  // Register onRequest hook for JWT middleware
-  fastify.addHook(
-    'onRequest',
-    async (request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        await request.jwtVerify();
-      } catch (err) {
-        reply.status(401).send({ error: 'Unauthorized' });
-      }
-    }
-  );
-
-  // Register routes
-  await fastify.register(galleryRoutes, { prefix: '/gallery' });
-}
-
-// Health check route
-fastify.get('/', async () => {
-  return { message: 'Welcome to the backend' };
-});
+// Mount Companion
+const { app: companionApp } = companion.app(companionOptions);
 
 const start = async () => {
   try {
-    await registerPlugins();
+    globalErrorHandler(fastify);
+
+    // Register @fastify/express plugin first
+    await fastify.register(fastifyExpress);
+
+    await registerPlugins(fastify);
+
+    // Register Companion Express middleware using Fastify Express
+    fastify.use('/s3', companionApp);
 
     const PORT = Number(process.env.PORT) || 8080;
     await fastify.listen({ port: PORT, host: '0.0.0.0' });

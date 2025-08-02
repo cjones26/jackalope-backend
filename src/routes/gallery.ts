@@ -1,19 +1,11 @@
 // gallery.ts - Combined route handlers with Zod type safety
 
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import path from 'path';
-import cloudinary from '../services/cloudinary';
-import Gallery from '../models/gallery';
+import cloudinary from '@/services/cloudinary';
+import Gallery from '@/models/gallery';
 import { GalleryQueryParams, IGallery } from '../types';
-import {
-  GalleryQueryParamsSchema,
-  ImageParamsSchema,
-  UpdateImageBodySchema,
-  DeleteMultipleImagesBodySchema,
-  ErrorResponseSchema,
-  GalleryResponseSchema,
-} from '../schemas/gallery';
+import jwtGuard from '@/hooks/jwtGuard';
 
 // Custom request interface for gallery routes
 interface GalleryRequest extends FastifyRequest {
@@ -91,6 +83,8 @@ const ensureImageExists = async (
 };
 
 export default async function galleryRoutes(fastify: FastifyInstance) {
+  fastify.addHook('onRequest', jwtGuard);
+
   // Keep your existing routes for now - this is just to show how Zod works
   // GET all images with pagination, sorting, and filtering
   fastify.get(
