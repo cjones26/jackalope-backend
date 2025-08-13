@@ -16,6 +16,9 @@
     "@fastify/express": "^4.0.2",
     "@fastify/jwt": "^9.1.0",
     "@fastify/multipart": "^9.0.3",
+    "@sinclair/typebox": "^0.34.38",
+    "@supabase/supabase-js": "^2.53.0",
+    "@types/node-fetch": "^2.6.13",
     "@uppy/companion": "^5.9.1",
     "cloudinary": "^2.6.0",
     "dotenv": "^16.4.7",
@@ -23,13 +26,15 @@
     "fastify-type-provider-zod": "^5.0.2",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.13.2",
+    "node-fetch": "^3.3.2",
     "pino-pretty": "^13.1.1",
     "zod": "^4.0.14"
   },
   "devDependencies": {
     "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^20.14.10",
-    "nodemon": "^3.1.9",
+    "nodemon": "^3.1.10",
+    "tsx": "^4.20.3",
     "typescript": "^5.5.3"
   }
 }

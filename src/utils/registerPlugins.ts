@@ -2,8 +2,8 @@ import { FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import fastifyJwt from '@fastify/jwt';
-import galleryRoutes from '@/routes/gallery';
 import { JWTPayload } from '@/types';
+import uploadRoutes from '@/routes/upload';
 
 export default async function registerPlugins(fastify: FastifyInstance) {
   // Get the secret from environment variables
@@ -44,5 +44,5 @@ export default async function registerPlugins(fastify: FastifyInstance) {
     return { message: 'Welcome to the backend' };
   });
 
-  await fastify.register(galleryRoutes, { prefix: '/gallery' });
+  await fastify.register(uploadRoutes, { prefix: '/api/v1/uploads' });
 }

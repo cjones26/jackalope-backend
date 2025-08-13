@@ -1,6 +1,13 @@
 {
   "watch": ["src"],
   "ext": "ts,js,json",
-  "ignore": ["src/**/*.spec.ts"],
-  "exec": "npx tsx src/index.ts"
+  "ignore": ["src/**/*.test.ts", "src/**/*.spec.ts", "dist/**"],
+  "exec": "tsx",
+  "script": "src/index.ts",
+  "env": {
+    "NODE_ENV": "development"
+  },
+  "delay": 1000,
+  "legacyWatch": false,
+  "verbose": true
 }
