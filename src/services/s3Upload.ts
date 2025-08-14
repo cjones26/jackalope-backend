@@ -9,6 +9,7 @@ import {
   PutObjectCommand,
   CopyObjectCommand,
   DeleteObjectCommand,
+  GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -208,6 +209,39 @@ export class S3UploadService {
     });
 
     await this.s3Client.send(command);
+  }
+
+  // Get file stream for secure access
+  async getFileStream(bucket: string, key: string): Promise<any> {
+    const command = new GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+    });
+
+    const response = await this.s3Client.send(command);
+    return response.Body;
+  }
+
+  // Generate signed URL for temporary access
+  async generateSignedUrl(bucket: string, key: string, expiresIn: number = 3600): Promise<string> {
+    const command = new GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+    });
+
+    // For LocalStack, we can still generate signed URLs for testing
+    if (process.env.AWS_ENDPOINT_URL?.includes('localhost')) {
+      // Generate proper signed URL even for LocalStack
+      return getSignedUrl(this.s3Client, command, { 
+        expiresIn,
+        // Ensure LocalStack URL is used
+        signableHeaders: new Set(),
+        unhoistableHeaders: new Set()
+      });
+    }
+
+    // For production AWS, use proper signed URLs
+    return getSignedUrl(this.s3Client, command, { expiresIn });
   }
 
   getS3Client(): S3Client {

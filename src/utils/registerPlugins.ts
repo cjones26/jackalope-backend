@@ -4,6 +4,8 @@ import multipart from '@fastify/multipart';
 import fastifyJwt from '@fastify/jwt';
 import { JWTPayload } from '@/types';
 import uploadRoutes from '@/routes/upload';
+import folderRoutes from '@/routes/folders';
+import signedUrlRoutes from '@/routes/signed-urls';
 
 export default async function registerPlugins(fastify: FastifyInstance) {
   // Get the secret from environment variables
@@ -45,4 +47,6 @@ export default async function registerPlugins(fastify: FastifyInstance) {
   });
 
   await fastify.register(uploadRoutes, { prefix: '/api/v1/uploads' });
+  await fastify.register(folderRoutes, { prefix: '/api/v1/folders' });
+  await fastify.register(signedUrlRoutes, { prefix: '/api/v1/signed-urls' });
 }
