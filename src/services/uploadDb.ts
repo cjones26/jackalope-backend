@@ -12,6 +12,9 @@ export interface UploadRecord {
   content_type: string;
   total_size: number;
   status: 'active' | 'completed' | 'aborted' | 'failed';
+  processing_status?: 'pending' | 'processing' | 'processed' | 'failed';
+  processing_progress?: number; // 0-100
+  processing_message?: string;
   upload_type: 'single' | 'multipart';
   parts: UploadPart[];
   created_at: Date;
@@ -47,6 +50,8 @@ export class UploadDbService {
         total_size: upload.totalSize,
         upload_type: upload.uploadType,
         status: 'active',
+        processing_status: 'pending',
+        processing_progress: 0,
         parts: [],
         created_at: new Date(),
         updated_at: new Date(),
@@ -265,6 +270,67 @@ export class UploadDbService {
     }
 
     return data || [];
+  }
+
+  async updateProcessingStatus(
+    uploadId: string,
+    userId: string,
+    processingStatus: 'pending' | 'processing' | 'processed' | 'failed',
+    progress?: number,
+    message?: string
+  ): Promise<void> {
+    const updateData: any = {
+      processing_status: processingStatus,
+      updated_at: new Date(),
+    };
+    
+    if (progress !== undefined) {
+      updateData.processing_progress = Math.max(0, Math.min(100, progress));
+    }
+    
+    if (message !== undefined) {
+      updateData.processing_message = message;
+    }
+
+    const { error } = await supabase
+      .from('uploads')
+      .update(updateData)
+      .eq('upload_id', uploadId)
+      .eq('user_id', userId);
+
+    if (error) {
+      throw new Error(`Failed to update processing status: ${error.message}`);
+    }
+  }
+
+  async getUploadStatus(uploadId: string, userId: string): Promise<{
+    upload_status: 'active' | 'completed' | 'aborted' | 'failed';
+    processing_status?: 'pending' | 'processing' | 'processed' | 'failed';
+    processing_progress?: number;
+    processing_message?: string;
+    ready_for_display: boolean;
+  } | null> {
+    const { data, error } = await supabase
+      .from('uploads')
+      .select('status, processing_status, processing_progress, processing_message, final_s3_key')
+      .eq('upload_id', uploadId)
+      .eq('user_id', userId)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') return null;
+      throw new Error(`Failed to get upload status: ${error.message}`);
+    }
+
+    return {
+      upload_status: data.status,
+      processing_status: data.processing_status,
+      processing_progress: data.processing_progress,
+      processing_message: data.processing_message,
+      ready_for_display: data.status === 'completed' && 
+                        (data.processing_status === 'processed' || data.processing_status === null) &&
+                        data.final_s3_key !== null
+    };
   }
 
   async cleanupStaleUploads(olderThanHours: number = 24): Promise<number> {

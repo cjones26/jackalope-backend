@@ -7,8 +7,10 @@ import { testSupabaseConnection } from '@/services/supabase';
 
 dotenv.config();
 
-// Create Fastify instance
-const fastify = Fastify({
+// Create Fastify instance with conditional HTTP/2 in production
+const isProduction = process.env.NODE_ENV === 'production';
+
+const fastifyOptions = {
   logger: {
     level: 'info',
     transport: {
@@ -19,7 +21,10 @@ const fastify = Fastify({
       },
     },
   },
-});
+  ...(isProduction && { http2: true }),
+};
+
+const fastify = Fastify(fastifyOptions);
 
 connectDatabase();
 
@@ -38,7 +43,11 @@ const start = async () => {
 
     const PORT = Number(process.env.PORT) || 8080;
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
-    console.log(`Server is running on port ${PORT}`);
+    console.log(
+      `Server is running on http://localhost:${PORT}${
+        isProduction ? ' with HTTP/2 (h2c)' : ''
+      }`
+    );
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

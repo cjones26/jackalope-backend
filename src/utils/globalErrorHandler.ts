@@ -1,6 +1,8 @@
-import { FastifyInstance } from 'fastify';
+import { FastifyInstance, RawServerBase } from 'fastify';
 
-export default async function globalErrorHandler(app: FastifyInstance) {
+export default async function globalErrorHandler<T extends RawServerBase>(
+  app: FastifyInstance<T>
+) {
   app.setErrorHandler(async (error, request, reply) => {
     app.log.error(error);
 

@@ -1,8 +1,4 @@
 // src/services/fileProcessor.ts
-import {
-  CopyObjectCommand,
-  DeleteObjectCommand,
-} from '@aws-sdk/client-s3';
 import { UploadDbService } from './uploadDb';
 import { S3UploadService } from './s3Upload';
 import {
@@ -47,10 +43,28 @@ export class FileProcessorService {
         return { success: false, error: 'Upload not completed' };
       }
 
+      // Mark as processing started
+      await this.uploadDbService.updateProcessingStatus(
+        uploadId,
+        userId,
+        'processing',
+        10,
+        'Starting file processing...'
+      );
+
       // Generate final key (same structure but in final bucket)
       const finalKey = uploadRecord.s3_key;
 
       try {
+        // Update processing status
+        await this.uploadDbService.updateProcessingStatus(
+          uploadId,
+          userId,
+          'processing',
+          25,
+          'Copying to final storage...'
+        );
+
         // Copy from temp bucket to final bucket
         await this.s3UploadService.copyObject(
           this.s3UploadService.getTempBucket(),
@@ -64,13 +78,30 @@ export class FileProcessorService {
         let thumbnailKey: string | undefined;
         let thumbnailUrl: string | undefined;
         let thumbnailCloudinaryUrl: string | undefined;
-        
+
         // Skip thumbnail generation for development with LocalStack
         console.log('Skipping thumbnail generation for development setup');
+
+        // Update processing status for virus scan
+        await this.uploadDbService.updateProcessingStatus(
+          uploadId,
+          userId,
+          'processing',
+          60,
+          'Running security scan...'
+        );
 
         // TODO: Run virus scan
         const virusScanResult = await this.performVirusScan(finalKey);
         if (!virusScanResult.clean) {
+          await this.uploadDbService.updateProcessingStatus(
+            uploadId,
+            userId,
+            'failed',
+            0,
+            'File failed security scan'
+          );
+
           // Delete the file and mark as failed
           await this.s3UploadService.deleteObject(
             this.s3UploadService.getFinalBucket(),
@@ -85,6 +116,15 @@ export class FileProcessorService {
           return { success: false, error: 'File failed virus scan' };
         }
 
+        // Update processing status to finalizing
+        await this.uploadDbService.updateProcessingStatus(
+          uploadId,
+          userId,
+          'processing',
+          90,
+          'Finalizing...'
+        );
+
         // Update database with final location and thumbnail info
         await this.uploadDbService.markUploadCompleted(
           uploadId,
@@ -94,6 +134,15 @@ export class FileProcessorService {
           thumbnailKey,
           thumbnailUrl,
           thumbnailCloudinaryUrl
+        );
+
+        // Mark processing as completed
+        await this.uploadDbService.updateProcessingStatus(
+          uploadId,
+          userId,
+          'processed',
+          100,
+          'Processing completed successfully'
         );
 
         // Clean up temp file
@@ -109,6 +158,19 @@ export class FileProcessorService {
           thumbnailUrl,
         };
       } catch (processingError) {
+        // Mark processing as failed with error message
+        await this.uploadDbService.updateProcessingStatus(
+          uploadId,
+          userId,
+          'failed',
+          0,
+          `Processing failed: ${
+            processingError instanceof Error
+              ? processingError.message
+              : 'Unknown error'
+          }`
+        );
+
         // Clean up any partial processing
         await this.cleanupFailedProcessing(finalKey, uploadRecord.s3_key);
         await this.uploadDbService.markUploadFailed(uploadId, userId);
@@ -123,7 +185,6 @@ export class FileProcessorService {
       };
     }
   }
-
 
   private async generateImageThumbnail(
     s3Url: string,
@@ -150,7 +211,9 @@ export class FileProcessorService {
 
     // Handle custom endpoint (like LocalStack)
     if (process.env.AWS_ENDPOINT_URL) {
-      return `${process.env.AWS_ENDPOINT_URL}/${this.s3UploadService.getFinalBucket()}/${key}`;
+      return `${
+        process.env.AWS_ENDPOINT_URL
+      }/${this.s3UploadService.getFinalBucket()}/${key}`;
     }
 
     return `https://${this.s3UploadService.getFinalBucket()}.s3.${region}.amazonaws.com/${key}`;
