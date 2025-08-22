@@ -36,11 +36,23 @@ const gallerySchema = new Schema<IGallery>(
     },
     width: {
       type: Number,
-      required: true,
+      required: false, // Optional for non-image files
     },
     height: {
       type: Number,
-      required: true,
+      required: false, // Optional for non-image files
+    },
+    duration: {
+      type: Number,
+      required: false, // For video/audio files
+    },
+    fileSize: {
+      type: Number,
+      required: false, // Size in bytes
+    },
+    mimeType: {
+      type: String,
+      required: true, // More generic than format
     },
     url: {
       type: String,

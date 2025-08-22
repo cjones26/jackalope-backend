@@ -1,6 +1,6 @@
 import { Document } from 'mongoose';
 
-// Gallery interface
+// Gallery interface (renamed from image-specific to item-generic)
 export interface IGallery extends Document {
   userId: string;
   assetId: string;
@@ -9,8 +9,11 @@ export interface IGallery extends Document {
   description?: string;
   tags: string[];
   format: string;
-  width: number;
-  height: number;
+  width?: number;  // Optional for non-image files
+  height?: number; // Optional for non-image files
+  duration?: number; // For video/audio files
+  fileSize?: number; // Size in bytes
+  mimeType: string; // More generic than format
   url: string;
   uploadedAt: Date;
   createdAt: Date;
@@ -54,7 +57,7 @@ export interface GalleryQueryParams {
 // Gallery response interface
 export interface GalleryResponse {
   message?: string;
-  images: IGallery[];
+  items: IGallery[];  // Changed from images to items
   total: number;
   currentPage: number;
   totalPages: number;

@@ -507,6 +507,84 @@ export default async function folderRoutes(fastify: FastifyInstance) {
     }
   );
 
+  // PATCH /folders/:id - Update folder (partial update)
+  fastify.patch<{
+    Params: { id: string };
+    Body: UpdateFolderRequest;
+  }>(
+    '/:id',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', minLength: 1, maxLength: 255 },
+            description: { type: 'string' },
+            parent_id: { type: 'string', format: 'uuid' },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const { id } = request.params;
+        const updateData = request.body;
+        const userId = request.user.id;
+
+        // Verify folder exists and user owns it
+        const { data: existing, error: existingError } = await supabase
+          .from('folders')
+          .select('*')
+          .eq('id', id)
+          .eq('owner_id', userId)
+          .single();
+
+        if (existingError || !existing) {
+          return reply.status(404).send({ error: 'Folder not found' });
+        }
+
+        // If changing parent, verify new parent exists and is owned by user
+        if (
+          updateData.parent_id &&
+          updateData.parent_id !== existing.parent_id
+        ) {
+          const { data: parent, error: parentError } = await supabase
+            .from('folders')
+            .select('id')
+            .eq('id', updateData.parent_id)
+            .eq('owner_id', userId)
+            .single();
+
+          if (parentError || !parent) {
+            return reply.status(400).send({ error: 'Parent folder not found' });
+          }
+        }
+
+        const { data, error } = await supabase
+          .from('folders')
+          .update(updateData)
+          .eq('id', id)
+          .eq('owner_id', userId)
+          .select()
+          .single();
+
+        if (error) {
+          if (error.code === '23505') {
+            return reply
+              .status(409)
+              .send({ error: 'Folder name already exists in this location' });
+          }
+          return reply.status(500).send({ error: error.message });
+        }
+
+        reply.send({ folder: data });
+      } catch (error) {
+        fastify.log.error(error);
+        reply.status(500).send({ error: 'Failed to update folder' });
+      }
+    }
+  );
+
   // POST /folders/:id/move - Move folder to different parent
   fastify.post<{
     Params: { id: string };
@@ -657,7 +735,7 @@ export default async function folderRoutes(fastify: FastifyInstance) {
     }
   );
 
-  // DELETE /folders/:id - Delete folder (and all contents)
+  // DELETE /folders/:id - Delete folder (and all contents including files)
   fastify.delete<{ Params: { id: string } }>('/:id', async (request, reply) => {
     try {
       const { id } = request.params;
@@ -675,7 +753,91 @@ export default async function folderRoutes(fastify: FastifyInstance) {
         return reply.status(404).send({ error: 'Folder not found' });
       }
 
-      // Delete folder (cascading will handle subfolders and set files to NULL folder_id)
+      // Recursively collect all folder IDs to be deleted (including subfolders)
+      const getAllFolderIds = async (folderId: string): Promise<string[]> => {
+        const { data: subfolders, error } = await supabase
+          .from('folders')
+          .select('id')
+          .eq('parent_id', folderId)
+          .eq('owner_id', userId);
+
+        if (error) {
+          throw new Error(`Failed to fetch subfolders: ${error.message}`);
+        }
+
+        let allIds = [folderId];
+        for (const subfolder of subfolders || []) {
+          const subIds = await getAllFolderIds(subfolder.id);
+          allIds = allIds.concat(subIds);
+        }
+        return allIds;
+      };
+
+      const allFolderIds = await getAllFolderIds(id);
+
+      // Get all files in these folders (including subfolders)
+      const { data: uploads, error: uploadsError } = await supabase
+        .from('uploads')
+        .select('id, upload_id, s3_key, final_s3_key, bucket, final_bucket, thumbnail_s3_key')
+        .in('folder_id', allFolderIds)
+        .eq('user_id', userId);
+
+      if (uploadsError) {
+        return reply.status(500).send({ error: `Failed to fetch uploads: ${uploadsError.message}` });
+      }
+
+      // Delete files from S3 first (both originals and thumbnails)
+      if (uploads && uploads.length > 0) {
+        const s3DeletePromises = uploads.flatMap((upload: any) => {
+          const promises = [];
+          
+          // Delete original file from final bucket if exists
+          if (upload.final_s3_key && upload.final_bucket) {
+            promises.push(
+              s3Service.deleteObject(upload.final_bucket, upload.final_s3_key).catch((err: any) => {
+                fastify.log.warn(`Failed to delete final S3 object ${upload.final_s3_key}:`, err);
+              })
+            );
+          }
+          
+          // Delete original file from temp bucket if exists
+          if (upload.s3_key && upload.bucket) {
+            promises.push(
+              s3Service.deleteObject(upload.bucket, upload.s3_key).catch((err: any) => {
+                fastify.log.warn(`Failed to delete temp S3 object ${upload.s3_key}:`, err);
+              })
+            );
+          }
+
+          // Delete thumbnail if exists
+          if (upload.thumbnail_s3_key && upload.final_bucket) {
+            promises.push(
+              s3Service.deleteObject(upload.final_bucket, upload.thumbnail_s3_key).catch((err: any) => {
+                fastify.log.warn(`Failed to delete thumbnail S3 object ${upload.thumbnail_s3_key}:`, err);
+              })
+            );
+          }
+          
+          return promises;
+        });
+
+        // Execute all S3 deletions in parallel
+        await Promise.all(s3DeletePromises);
+
+        // Delete uploads from database
+        const { error: deleteUploadsError } = await supabase
+          .from('uploads')
+          .delete()
+          .in('folder_id', allFolderIds)
+          .eq('user_id', userId);
+
+        if (deleteUploadsError) {
+          fastify.log.error('Error deleting uploads from database:', deleteUploadsError);
+          return reply.status(500).send({ error: 'Failed to delete files from database' });
+        }
+      }
+
+      // Delete folder (cascading will handle subfolders)
       const { error } = await supabase
         .from('folders')
         .delete()
@@ -686,7 +848,12 @@ export default async function folderRoutes(fastify: FastifyInstance) {
         return reply.status(500).send({ error: error.message });
       }
 
-      reply.send({ success: true, message: 'Folder deleted successfully' });
+      reply.send({ 
+        success: true, 
+        message: 'Folder and all contents deleted successfully',
+        deletedUploads: uploads?.length || 0,
+        deletedFolders: allFolderIds.length
+      });
     } catch (error) {
       fastify.log.error(error);
       reply.status(500).send({ error: 'Failed to delete folder' });

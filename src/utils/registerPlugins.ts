@@ -7,6 +7,7 @@ import uploadRoutes from '@/routes/upload';
 import folderRoutes from '@/routes/folders';
 import signedUrlRoutes from '@/routes/signed-urls';
 import uploadStatusRoutes from '@/routes/upload-status';
+import profileRoutes from '@/routes/profile';
 
 export default async function registerPlugins<T extends RawServerBase>(
   fastify: FastifyInstance<T>
@@ -17,7 +18,7 @@ export default async function registerPlugins<T extends RawServerBase>(
   // Register CORS
   await fastify.register(cors, {
     origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   });
 
   // Register multipart for file uploads
@@ -53,4 +54,5 @@ export default async function registerPlugins<T extends RawServerBase>(
   await fastify.register(folderRoutes, { prefix: '/api/v1/folders' });
   await fastify.register(signedUrlRoutes, { prefix: '/api/v1/signed-urls' });
   await fastify.register(uploadStatusRoutes);
+  await fastify.register(profileRoutes, { prefix: '/api/v1/profile' });
 }

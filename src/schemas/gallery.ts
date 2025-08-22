@@ -6,8 +6,8 @@ export const JWTUserSchema = z.object({
   email: z.string().email(),
 });
 
-// Gallery item schema
-export const GalleryImageSchema = z.object({
+// Gallery item schema (updated to support all file types)
+export const GalleryItemSchema = z.object({
   _id: z.string(),
   userId: z.string(),
   assetId: z.string(),
@@ -16,8 +16,11 @@ export const GalleryImageSchema = z.object({
   description: z.string().optional(),
   tags: z.array(z.string()),
   format: z.string(),
-  width: z.number(),
-  height: z.number(),
+  width: z.number().optional(),  // Optional for non-image files
+  height: z.number().optional(), // Optional for non-image files
+  duration: z.number().optional(), // For video/audio files
+  fileSize: z.number().optional(), // Size in bytes
+  mimeType: z.string(), // More generic than format
   url: z.string().url(),
   uploadedAt: z.date(),
   createdAt: z.date(),
@@ -38,25 +41,25 @@ export const GalleryQueryParamsSchema = z.object({
 });
 
 export const GalleryResponseSchema = z.object({
-  images: z.array(GalleryImageSchema),
+  items: z.array(GalleryItemSchema),  // Changed from images to items
   total: z.number(),
   currentPage: z.number(),
   totalPages: z.number(),
   hasMore: z.boolean(),
 });
 
-export const ImageParamsSchema = z.object({
+export const ItemParamsSchema = z.object({
   id: z.string(),
 });
 
-export const UpdateImageBodySchema = z.object({
+export const UpdateItemBodySchema = z.object({
   title: z.string().optional(),
   description: z.string().optional(),
   tags: z.array(z.string()).optional(),
 });
 
-export const DeleteMultipleImagesBodySchema = z.object({
-  imageIds: z.array(z.string()).min(1),
+export const DeleteMultipleItemsBodySchema = z.object({
+  itemIds: z.array(z.string()).min(1),
 });
 
 export const ErrorResponseSchema = z.object({
@@ -65,12 +68,12 @@ export const ErrorResponseSchema = z.object({
 
 // Type definitions for TypeScript inference
 export type JWTUser = z.infer<typeof JWTUserSchema>;
-export type GalleryImage = z.infer<typeof GalleryImageSchema>;
+export type GalleryItem = z.infer<typeof GalleryItemSchema>;
 export type GalleryQueryParams = z.infer<typeof GalleryQueryParamsSchema>;
 export type GalleryResponse = z.infer<typeof GalleryResponseSchema>;
-export type ImageParams = z.infer<typeof ImageParamsSchema>;
-export type UpdateImageBody = z.infer<typeof UpdateImageBodySchema>;
-export type DeleteMultipleImagesBody = z.infer<
-  typeof DeleteMultipleImagesBodySchema
+export type ItemParams = z.infer<typeof ItemParamsSchema>;
+export type UpdateItemBody = z.infer<typeof UpdateItemBodySchema>;
+export type DeleteMultipleItemsBody = z.infer<
+  typeof DeleteMultipleItemsBodySchema
 >;
 export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
