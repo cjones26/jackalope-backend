@@ -1,15 +1,18 @@
-// src/routes/signed-urls.ts - Generate secure signed URLs
+// Signed URLs routes - Secure file access with permission checks
+// Generates presigned URLs for files using owner's storage configuration
+
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { supabase } from '@/services/supabase';
-import { S3UploadService } from '@/services/s3Upload';
+import { StorageService } from '@/services/storageService';
+import { getHubStorageConfig } from '@/services/hubStorageConfigService';
+import { PermissionService } from '@/services/permissionService';
 
 interface SignedUrlRequest {
-  Params: { 
-    uploadId: string; 
+  Params: {
+    uploadId: string;
   };
   Querystring: {
     thumbnail?: 'true' | 'false';
-    expires?: string; // Duration in seconds, max 3600 (1 hour)
+    expires?: string;
   };
 }
 
@@ -22,7 +25,9 @@ interface BulkSignedUrlRequest {
 }
 
 export default async function signedUrlRoutes(fastify: FastifyInstance) {
-  const s3Service = new S3UploadService();
+  const storageService = new StorageService();
+  
+  const permissionService = new PermissionService();
 
   // Ensure user is authenticated for all routes
   fastify.addHook('preHandler', async (request, reply) => {
@@ -41,65 +46,67 @@ export default async function signedUrlRoutes(fastify: FastifyInstance) {
         const { uploadId } = request.params;
         const { thumbnail = 'false', expires = '3600' } = request.query;
         const userId = request.user.id;
-        const expiresIn = Math.min(parseInt(expires), 3600); // Max 1 hour
 
-        // Check if user has access to this file
-        const { data: upload, error } = await supabase
-          .from('uploads')
-          .select(`
-            *,
-            folder:folders(
-              id,
-              owner_id,
-              folder_shares(shared_with, shared_by, expires_at)
-            )
-          `)
-          .eq('upload_id', uploadId)
-          .eq('status', 'completed')
-          .single();
+        const useThumbnail = thumbnail === 'true';
+        const expiresIn = parseInt(expires, 10);
 
-        if (error || !upload) {
-          return reply.status(404).send({ error: 'File not found' });
-        }
-
-        // Check access permissions
-        const folder = upload.folder as any;
-        const hasAccess = 
-          // User owns the file
-          upload.user_id === userId ||
-          // File is in a folder owned by user  
-          (folder && folder.owner_id === userId) ||
-          // File is in a shared folder where user has access
-          (folder?.folder_shares && folder.folder_shares.some((share: any) => 
-            (share.shared_with === userId || share.shared_with === null) && 
-            (!share.expires_at || new Date(share.expires_at) > new Date())
-          ));
-
-        if (!hasAccess) {
-          return reply.status(403).send({ error: 'Access denied' });
-        }
-
-        // Generate signed URL
-        const s3Key = thumbnail === 'true' && upload.thumbnail_s3_key 
-          ? upload.thumbnail_s3_key 
-          : (upload.final_s3_key || upload.s3_key);
-        
-        const bucket = upload.final_bucket || upload.bucket;
-
-        try {
-          const signedUrl = await s3Service.generateSignedUrl(bucket, s3Key, expiresIn);
-          
-          reply.send({ 
-            url: signedUrl,
-            expires_in: expiresIn,
-            expires_at: new Date(Date.now() + expiresIn * 1000).toISOString()
+        // Validate expiration time
+        if (isNaN(expiresIn) || expiresIn < 300 || expiresIn > 3600) {
+          return reply.status(400).send({
+            error: 'Invalid expiration time. Must be between 300 and 3600 seconds.',
           });
-
-        } catch (s3Error) {
-          fastify.log.error('S3 signed URL error:', s3Error);
-          return reply.status(500).send({ error: 'Failed to generate signed URL' });
         }
 
+        // Check user access
+        const { hasAccess, upload, ownerId } = await permissionService.checkFileAccess(
+          uploadId,
+          userId
+        );
+
+        if (!hasAccess || !upload || !ownerId) {
+          return reply.status(404).send({
+            error: 'File not found or access denied',
+          });
+        }
+
+        // Get the hub's storage configuration
+        const config = upload.hub_id ? await getHubStorageConfig(upload.hub_id) : null;
+
+        if (!config) {
+          return reply.status(500).send({
+            error: 'Hub storage not configured',
+            message: 'This file\'s hub does not have storage configured.',
+          });
+        }
+
+        // Determine which file key to use
+        let fileKey = upload.file_key;
+
+        // If thumbnail is requested and available, use thumbnail key
+        if (useThumbnail && upload.thumbnail_s3_key) {
+          fileKey = upload.thumbnail_s3_key;
+        }
+
+        // Generate presigned download URL using hub's credentials
+        const result = await storageService.generatePresignedDownloadUrl(
+          config as any,
+          fileKey,
+          expiresIn
+        );
+
+        if (!result.success || !result.url) {
+          return reply.status(500).send({
+            error: result.error || 'Failed to generate signed URL',
+          });
+        }
+
+        return reply.send({
+          url: result.url,
+          expiresIn: result.expiresIn,
+          filename: upload.filename,
+          contentType: upload.content_type,
+          fileSize: upload.file_size_bytes,
+        });
       } catch (error) {
         fastify.log.error('Signed URL error:', error);
         reply.status(500).send({ error: 'Internal server error' });
@@ -107,7 +114,7 @@ export default async function signedUrlRoutes(fastify: FastifyInstance) {
     }
   );
 
-  // POST /signed-urls/bulk - Get signed URLs for multiple files (performance optimization)
+  // POST /signed-urls/bulk - Get signed URLs for multiple files
   fastify.post<BulkSignedUrlRequest>(
     '/bulk',
     {
@@ -116,94 +123,97 @@ export default async function signedUrlRoutes(fastify: FastifyInstance) {
           type: 'object',
           required: ['uploadIds'],
           properties: {
-            uploadIds: { 
-              type: 'array', 
+            uploadIds: {
+              type: 'array',
               items: { type: 'string' },
-              maxItems: 50 // Limit bulk requests
+              maxItems: 50,
             },
             thumbnail: { type: 'boolean', default: false },
-            expires: { type: 'number', minimum: 300, maximum: 3600, default: 3600 }
-          }
-        }
-      }
+            expires: { type: 'number', minimum: 300, maximum: 3600, default: 3600 },
+          },
+        },
+      },
     },
     async (request: FastifyRequest<BulkSignedUrlRequest>, reply: FastifyReply) => {
       try {
         const { uploadIds, thumbnail = false, expires = 3600 } = request.body;
         const userId = request.user.id;
 
-        // Get all uploads with permissions check
-        const { data: uploads, error } = await supabase
-          .from('uploads')
-          .select(`
-            upload_id,
-            user_id,
-            s3_key,
-            final_s3_key,
-            bucket,
-            final_bucket,
-            thumbnail_s3_key,
-            folder:folders(
-              id,
-              owner_id,
-              folder_shares(shared_with, shared_by, expires_at)
-            )
-          `)
-          .in('upload_id', uploadIds)
-          .eq('status', 'completed');
+        // Process each upload ID and generate signed URLs
+        const results = await Promise.all(
+          uploadIds.map(async (uploadId) => {
+            try {
+              // Check user access
+              const { hasAccess, upload, ownerId } = await permissionService.checkFileAccess(
+                uploadId,
+                userId
+              );
 
-        if (error) {
-          return reply.status(500).send({ error: 'Database error' });
-        }
+              if (!hasAccess || !upload || !ownerId) {
+                return {
+                  uploadId,
+                  success: false,
+                  error: 'File not found or access denied',
+                };
+              }
 
-        const results: Record<string, { url: string; expires_at: string } | { error: string }> = {};
+              // Get the hub's storage configuration
+              const config = upload.hub_id ? await getHubStorageConfig(upload.hub_id) : null;
 
-        // Process each file
-        for (const upload of uploads || []) {
-          const uploadId = upload.upload_id;
+              if (!config) {
+                return {
+                  uploadId,
+                  success: false,
+                  error: 'Hub storage not configured',
+                };
+              }
 
-          // Check access permissions
-          const folder = upload.folder as any;
-          const hasAccess = 
-            upload.user_id === userId ||
-            (folder && folder.owner_id === userId) ||
-            (folder?.folder_shares && folder.folder_shares.some((share: any) => 
-              (share.shared_with === userId || share.shared_with === null) && 
-              (!share.expires_at || new Date(share.expires_at) > new Date())
-            ));
+              // Determine which file key to use
+              let fileKey = upload.file_key;
 
-          if (!hasAccess) {
-            results[uploadId] = { error: 'Access denied' };
-            continue;
-          }
+              // If thumbnail is requested and available, use thumbnail key
+              if (thumbnail && upload.thumbnail_s3_key) {
+                fileKey = upload.thumbnail_s3_key;
+              }
 
-          try {
-            const s3Key = thumbnail && upload.thumbnail_s3_key 
-              ? upload.thumbnail_s3_key 
-              : (upload.final_s3_key || upload.s3_key);
-            
-            const bucket = upload.final_bucket || upload.bucket;
-            const signedUrl = await s3Service.generateSignedUrl(bucket, s3Key, expires);
-            
-            results[uploadId] = {
-              url: signedUrl,
-              expires_at: new Date(Date.now() + expires * 1000).toISOString()
-            };
+              // Generate presigned download URL using hub's credentials
+              const result = await storageService.generatePresignedDownloadUrl(
+                config as any,
+                fileKey,
+                expires
+              );
 
-          } catch (s3Error) {
-            results[uploadId] = { error: 'Failed to generate signed URL' };
-          }
-        }
+              if (!result.success || !result.url) {
+                return {
+                  uploadId,
+                  success: false,
+                  error: result.error || 'Failed to generate signed URL',
+                };
+              }
 
-        // Add not found errors for missing uploads
-        for (const uploadId of uploadIds) {
-          if (!results[uploadId]) {
-            results[uploadId] = { error: 'File not found' };
-          }
-        }
+              return {
+                uploadId,
+                success: true,
+                url: result.url,
+                expiresIn: result.expiresIn,
+                filename: upload.filename,
+                contentType: upload.content_type,
+                fileSize: upload.file_size_bytes,
+              };
+            } catch (error) {
+              fastify.log.error(`Error processing uploadId ${uploadId}:`, error);
+              return {
+                uploadId,
+                success: false,
+                error: 'Internal server error',
+              };
+            }
+          })
+        );
 
-        reply.send(results);
-
+        return reply.send({
+          results,
+        });
       } catch (error) {
         fastify.log.error('Bulk signed URL error:', error);
         reply.status(500).send({ error: 'Internal server error' });

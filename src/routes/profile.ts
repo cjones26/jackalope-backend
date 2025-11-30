@@ -1,12 +1,21 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
+import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { supabase } from '@/services/supabase';
 
 const updateProfileSchema = z.object({
   firstName: z.string().min(1, 'First name is required'),
   lastName: z.string().min(1, 'Last name is required'),
   avatarUrl: z.string().nullable().optional(),
+  storageConfig: z.object({
+    endpointUrl: z.string().url(),
+    region: z.string().min(1),
+    bucketName: z.string().min(1).max(255),
+    accessKeyId: z.string().min(1),
+    secretAccessKey: z.string().min(1),
+    forcePathStyle: z.boolean(),
+  }).optional(),
 });
 
 const avatarUploadSchema = z.object({
@@ -28,7 +37,7 @@ export default async function profileRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // Get user profile
+  // Get user profile (including hubs)
   fastify.get(
     '/me',
     {
@@ -44,6 +53,40 @@ export default async function profileRoutes(fastify: FastifyInstance) {
                   first_name: { type: ['string', 'null'] },
                   last_name: { type: ['string', 'null'] },
                   avatar_url: { type: ['string', 'null'] },
+                  hubs: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        hub_id: { type: 'string' },
+                        role: { type: 'string' },
+                        status: { type: 'string' },
+                        hubs: {
+                          type: 'object',
+                          properties: {
+                            id: { type: 'string' },
+                            name: { type: 'string' },
+                            slug: { type: 'string' },
+                            description: { type: ['string', 'null'] },
+                            is_active: { type: 'boolean' },
+                            hub_storage_config: {
+                              type: ['object', 'null'],
+                              properties: {
+                                id: { type: 'string' },
+                                name: { type: 'string' },
+                                provider_type: { type: 'string' },
+                                endpoint_url: { type: 'string' },
+                                region: { type: 'string' },
+                                bucket_name: { type: 'string' },
+                                force_path_style: { type: 'boolean' },
+                                is_active: { type: 'boolean' },
+                              },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
                 },
                 required: ['first_name', 'last_name', 'avatar_url'],
               },
@@ -80,9 +123,66 @@ export default async function profileRoutes(fastify: FastifyInstance) {
         throw error;
       }
 
+      // Fetch user's hubs and their storage configs
+      const { data: hubMemberships, error: hubError } = await supabase
+        .from('hub_members')
+        .select(`
+          hub_id,
+          role,
+          status,
+          hubs:hub_id (
+            id,
+            name,
+            slug,
+            description,
+            is_active,
+            hub_storage_configs (
+              id,
+              name,
+              provider_type,
+              endpoint_url,
+              region,
+              bucket_name,
+              force_path_style,
+              is_active
+            )
+          )
+        `)
+        .eq('user_id', request.user.id)
+        .eq('status', 'active');
+
+      console.log('Hub memberships query result:', {
+        hubMemberships,
+        hubError,
+        userId: request.user.id,
+        storageConfigs: hubMemberships?.map((m: any) => ({
+          hubId: m.hubs?.id,
+          hubName: m.hubs?.name,
+          configs: m.hubs?.hub_storage_configs
+        }))
+      });
+
+      // Transform hub_storage_configs from array to single object (singular name)
+      const transformedHubs = (hubMemberships || []).map((membership: any) => {
+        const storageConfig = Array.isArray(membership.hubs?.hub_storage_configs)
+          ? membership.hubs.hub_storage_configs[0]
+          : membership.hubs?.hub_storage_configs;
+
+        return {
+          ...membership,
+          hubs: {
+            ...membership.hubs,
+            hub_storage_config: storageConfig || null,
+          },
+        };
+      });
+
       return reply.send({
         success: true,
-        data: profile,
+        data: {
+          ...profile,
+          hubs: transformedHubs,
+        },
       });
     } catch (error) {
       console.error('Error fetching profile:', error);
@@ -118,6 +218,17 @@ export default async function profileRoutes(fastify: FastifyInstance) {
                   first_name: { type: 'string' },
                   last_name: { type: 'string' },
                   avatar_url: { type: ['string', 'null'] },
+                  storage_config: {
+                    type: ['object', 'null'],
+                    properties: {
+                      id: { type: 'string' },
+                      endpoint_url: { type: 'string' },
+                      region: { type: 'string' },
+                      bucket_name: { type: 'string' },
+                      force_path_style: { type: 'boolean' },
+                      created_at: { type: 'string' },
+                    },
+                  },
                 },
                 required: ['first_name', 'last_name'],
               },
@@ -129,8 +240,9 @@ export default async function profileRoutes(fastify: FastifyInstance) {
     },
     async (request: FastifyRequest<{ Body: UpdateProfileBody }> & { user: { id: string; email: string } }, reply: FastifyReply) => {
       try {
-        const { firstName, lastName, avatarUrl } = request.body;
+        const { firstName, lastName, avatarUrl, storageConfig } = request.body;
 
+        // Update user profile
         const { data: updatedProfile, error } = await supabase
           .from('users')
           .update({
@@ -147,9 +259,123 @@ export default async function profileRoutes(fastify: FastifyInstance) {
           throw error;
         }
 
+        // Update storage config if provided
+        let updatedStorageConfig = null;
+        if (storageConfig) {
+          // Check if user already has a storage config
+          const { data: existing } = await supabase
+            .from('user_storage_configs')
+            .select('id')
+            .eq('user_id', request.user.id)
+            .single();
+
+          if (existing) {
+            // Storage config already exists - it's immutable, so reject the update
+            return reply.code(400).send({
+              error: 'Storage configuration is immutable',
+              message: 'Storage configuration cannot be modified once set. You must clear it first if you wish to reconfigure.',
+            });
+          }
+
+          // No existing config - this is first-time setup, validate storage before saving
+          const s3Client = new S3Client({
+            endpoint: storageConfig.endpointUrl,
+            region: storageConfig.region,
+            credentials: {
+              accessKeyId: storageConfig.accessKeyId,
+              secretAccessKey: storageConfig.secretAccessKey,
+            },
+            forcePathStyle: storageConfig.forcePathStyle,
+          });
+
+          // Generate a unique test file key
+          const testKey = `.jackalope-test/${request.user.id}/${uuidv4()}.txt`;
+          const testContent = 'Jackalope storage test - safe to delete';
+
+          // Test write access
+          try {
+            await s3Client.send(
+              new PutObjectCommand({
+                Bucket: storageConfig.bucketName,
+                Key: testKey,
+                Body: testContent,
+                ContentType: 'text/plain',
+              })
+            );
+
+            // Clean up test file
+            try {
+              await s3Client.send(
+                new DeleteObjectCommand({
+                  Bucket: storageConfig.bucketName,
+                  Key: testKey,
+                })
+              );
+            } catch (cleanupError) {
+              // Non-critical - just log
+              fastify.log.warn('Failed to delete test file:', cleanupError);
+            }
+          } catch (storageError: any) {
+            // Provide specific error messages based on error type
+            if (storageError.name === 'NoSuchBucket') {
+              return reply.code(400).send({
+                error: 'Bucket does not exist',
+                message: `The bucket "${storageConfig.bucketName}" was not found. Please verify the bucket name.`,
+              });
+            }
+
+            if (storageError.name === 'InvalidAccessKeyId' || storageError.name === 'SignatureDoesNotMatch') {
+              return reply.code(400).send({
+                error: 'Invalid credentials',
+                message: 'The access key ID or secret access key is incorrect.',
+              });
+            }
+
+            if (storageError.name === 'AccessDenied' || storageError.name === 'AllAccessDisabled') {
+              return reply.code(400).send({
+                error: 'Access denied',
+                message: 'The credentials do not have write permission to this bucket.',
+              });
+            }
+
+            if (storageError.code === 'ENOTFOUND' || storageError.code === 'ECONNREFUSED') {
+              return reply.code(400).send({
+                error: 'Connection failed',
+                message: `Could not connect to "${storageConfig.endpointUrl}". Please verify the endpoint URL.`,
+              });
+            }
+
+            return reply.code(400).send({
+              error: 'Storage validation failed',
+              message: storageError.message || 'Failed to validate storage configuration',
+            });
+          }
+
+          // Validation passed - create new storage config
+          const { data: created, error: createError } = await supabase
+            .from('user_storage_configs')
+            .insert({
+              user_id: request.user.id,
+              endpoint_url: storageConfig.endpointUrl,
+              region: storageConfig.region,
+              bucket_name: storageConfig.bucketName,
+              access_key_id: storageConfig.accessKeyId,
+              secret_access_key: storageConfig.secretAccessKey,
+              force_path_style: storageConfig.forcePathStyle,
+            })
+            .select('id, endpoint_url, region, bucket_name, force_path_style, created_at')
+            .single();
+
+          if (createError) throw createError;
+          updatedStorageConfig = created;
+        }
+
         return reply.send({
           success: true,
-          data: updatedProfile,
+          data: {
+            ...updatedProfile,
+            storage_config: updatedStorageConfig,
+          },
         });
       } catch (error) {
         console.error('Error updating profile:', error);
@@ -250,6 +476,69 @@ export default async function profileRoutes(fastify: FastifyInstance) {
     }
   });
 
+  // Delete storage configuration
+  // WARNING: This will delete all folders and file metadata but files remain in the bucket
+  fastify.delete('/storage-config', async (request: FastifyRequest & { user: { id: string; email: string } }, reply: FastifyReply) => {
+    try {
+      // Check if user has a storage config
+      const { data: existing } = await supabase
+        .from('user_storage_configs')
+        .select('id')
+        .eq('user_id', request.user.id)
+        .single();
+
+      if (!existing) {
+        return reply.code(404).send({
+          error: 'No storage configuration found',
+          message: 'You do not have a storage configuration to delete',
+        });
+      }
+
+      // Delete all file metadata (uploads table records)
+      const { error: uploadsDeleteError } = await supabase
+        .from('uploads')
+        .delete()
+        .eq('user_id', request.user.id);
+
+      if (uploadsDeleteError) {
+        fastify.log.error('Error deleting uploads:', uploadsDeleteError);
+        throw uploadsDeleteError;
+      }
+
+      // Delete all folders (folders table records)
+      const { error: foldersDeleteError } = await supabase
+        .from('folders')
+        .delete()
+        .eq('owner_id', request.user.id);
+
+      if (foldersDeleteError) {
+        fastify.log.error('Error deleting folders:', foldersDeleteError);
+        throw foldersDeleteError;
+      }
+
+      // Delete storage configuration
+      const { error: configDeleteError } = await supabase
+        .from('user_storage_configs')
+        .delete()
+        .eq('user_id', request.user.id);
+
+      if (configDeleteError) {
+        throw configDeleteError;
+      }
+
+      return reply.send({
+        success: true,
+        message: 'Storage configuration, folders, and all file metadata have been deleted. Files remain in your bucket.',
+      });
+    } catch (error) {
+      console.error('Error deleting storage configuration:', error);
+      return reply.code(500).send({
+        error: 'Internal server error',
+        message: 'Failed to delete storage configuration',
+      });
+    }
+  });
+
   // Delete avatar
   fastify.delete('/avatar', async (request: FastifyRequest & { user: { id: string; email: string } }, reply: FastifyReply) => {
     try {
@@ -330,4 +619,5 @@ export default async function profileRoutes(fastify: FastifyInstance) {
       });
     }
   });
+
 }

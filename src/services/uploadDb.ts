@@ -1,6 +1,12 @@
 // src/services/uploadDb.ts
 import { supabase } from './supabase';
-import { UploadPart } from './s3Upload';
+
+export interface UploadPart {
+  partNumber: number;
+  etag: string;
+  size: number;
+  uploadedAt: Date;
+}
 
 export interface UploadRecord {
   id: string;

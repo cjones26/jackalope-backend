@@ -1,30 +1,17 @@
-// src/routes/upload.ts
+// Upload routes - S3-compatible file upload with hub-based storage
+
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { S3UploadService } from '@/services/s3Upload';
-import { UploadDbService } from '@/services/uploadDb';
-import { FileProcessorService } from '@/services/fileProcessing';
-import {
-  InitiateUploadSchema,
-  GetUploadUrlSchema,
-  CompletePartSchema,
-  CompleteUploadSchema,
-  AbortUploadSchema,
-  UploadStatusSchema,
-  InitiateUploadRequest,
-  GetUploadUrlRequest,
-  CompletePartRequest,
-  CompleteUploadRequest,
-  AbortUploadRequest,
-  UploadStatusRequest,
-  InitiateUploadResponse,
-  GetUploadUrlResponse,
-  UploadStatusResponse,
-} from '@/schemas/upload';
+import { v4 as uuidv4 } from 'uuid';
+import { StorageService } from '@/services/storageService';
+import { getHubStorageConfig } from '@/services/hubStorageConfigService';
+import { supabase } from '@/services/supabase';
+import { Database } from '@/types/database';
+
+type UploadInsert = Database['public']['Tables']['uploads']['Insert'];
+type UploadRow = Database['public']['Tables']['uploads']['Row'];
 
 export default async function uploadRoutes(fastify: FastifyInstance) {
-  const s3Service = new S3UploadService();
-  const uploadDbService = new UploadDbService();
-  const fileProcessor = new FileProcessorService(s3Service);
+  const storageService = new StorageService();
 
   // Hook to ensure user is authenticated for all upload routes
   fastify.addHook('preHandler', async (request, reply) => {
@@ -35,445 +22,931 @@ export default async function uploadRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // Initiate upload (auto-detects single vs multipart)
-  fastify.post<{ Body: InitiateUploadRequest; Reply: InitiateUploadResponse }>(
+  // POST /initiate - Initiate upload
+  fastify.post<{
+    Body: {
+      hubId: string;
+      filename: string;
+      contentType: string;
+      totalSize: number;
+      chunkSize?: number;
+      folderId?: string;
+      thumbnailFileName?: string;
+    };
+  }>(
     '/initiate',
     {
       schema: {
-        body: InitiateUploadSchema,
-        response: {
-          200: {
-            type: 'object',
-            properties: {
-              uploadId: { type: 'string' },
-              s3Key: { type: 'string' },
-              uploadType: { type: 'string' },
-              chunkSize: { type: 'number' },
-              totalChunks: { type: 'number' },
-            },
+        body: {
+          type: 'object',
+          required: ['hubId', 'filename', 'contentType', 'totalSize'],
+          properties: {
+            hubId: { type: 'string', format: 'uuid' },
+            filename: { type: 'string' },
+            contentType: { type: 'string' },
+            totalSize: { type: 'number' },
+            chunkSize: { type: 'number' },
+            folderId: { type: 'string', format: 'uuid' },
+            thumbnailFileName: { type: 'string' },
           },
         },
       },
     },
-    async (
-      request: FastifyRequest<{ Body: InitiateUploadRequest }>,
-      reply: FastifyReply
-    ) => {
+    async (request, reply) => {
       try {
-        const {
-          filename,
-          contentType,
-          totalSize,
-          chunkSize = 10 * 1024 * 1024,
-        } = request.body;
+        const { hubId, filename, contentType, totalSize, chunkSize = 10 * 1024 * 1024, folderId, thumbnailFileName } = request.body;
         const userId = request.user.id;
 
-        // Auto-detect upload type based on file size
-        const MULTIPART_THRESHOLD = 5 * 1024 * 1024; // 5MB
-        const uploadType =
-          totalSize >= MULTIPART_THRESHOLD ? 'multipart' : 'single';
-
-        let uploadId: string;
-        let key: string;
-
-        if (uploadType === 'multipart') {
-          // Initiate S3 multipart upload
-          const result = await s3Service.initiateMultipartUpload(
-            userId,
-            filename,
-            contentType,
-            totalSize
-          );
-          uploadId = result.uploadId;
-          key = result.key;
-        } else {
-          // For single-part uploads, generate a unique ID and key
-          uploadId = `single-${Date.now()}-${Math.random()
-            .toString(36)
-            .substr(2, 9)}`;
-          key = s3Service.generateS3Key(userId, filename);
+        // Get hub's storage config
+        const config = await getHubStorageConfig(hubId);
+        if (!config) {
+          return reply.status(400).send({
+            error: 'Hub storage not configured',
+            message: 'This hub does not have storage configured. Hub admins must configure S3-compatible storage first.',
+          });
         }
 
-        // Store upload metadata in database
-        await uploadDbService.createUploadRecord({
-          userId,
-          uploadId,
-          s3Key: key,
-          bucket: s3Service.getTempBucket(),
+        // Generate unique upload ID and S3 key
+        const uploadId = uuidv4();
+        const fileKey = storageService.generateKey(userId, uploadId, filename);
+
+        // Determine upload type based on file size
+        const uploadType = storageService.shouldUseMultipart(totalSize) ? 'multipart' : 'single';
+        const totalChunks = uploadType === 'multipart' ? Math.ceil(totalSize / chunkSize) : 1;
+
+        let s3UploadId: string | undefined;
+        let partsData: any = [];
+
+        // For multipart uploads, initiate S3 multipart upload
+        if (uploadType === 'multipart') {
+          const initResult = await storageService.initiateMultipartUpload(config as any, fileKey, contentType);
+
+          if (!initResult.success || !initResult.s3UploadId) {
+            return reply.status(500).send({
+              error: 'Failed to initiate upload',
+              message: initResult.error || 'Could not start multipart upload with S3',
+            });
+          }
+
+          s3UploadId = initResult.s3UploadId;
+          partsData = { s3UploadId, parts: [] };
+        }
+
+        // Handle thumbnail for videos
+        let thumbnailUploadUrl: string | undefined;
+        let thumbnailS3Key: string | undefined;
+
+        if (thumbnailFileName) {
+          // Generate S3 key for thumbnail
+          thumbnailS3Key = storageService.generateKey(userId, uploadId, thumbnailFileName);
+
+          // Generate presigned URL for thumbnail upload
+          const thumbnailUrlResult = await storageService.generatePresignedUploadUrl(
+            config as any,
+            thumbnailS3Key,
+            'image/jpeg'
+          );
+
+          if (thumbnailUrlResult.success && thumbnailUrlResult.url) {
+            thumbnailUploadUrl = thumbnailUrlResult.url;
+          } else {
+            fastify.log.warn('Failed to generate thumbnail upload URL:', thumbnailUrlResult.error);
+          }
+        }
+
+        // Create upload record in database
+        const uploadRecord: UploadInsert = {
+          upload_id: uploadId,
+          user_id: userId,
+          hub_id: hubId,
+          hub_storage_config_id: config.id,
+          file_key: fileKey,
+          bucket_name: config.bucket_name,
           filename,
-          contentType,
-          totalSize,
-          uploadType,
-        });
+          content_type: contentType,
+          total_size: totalSize,
+          status: 'active',
+          upload_type: uploadType,
+          parts: partsData,
+          folder_id: folderId || null,
+          thumbnail_s3_key: thumbnailS3Key || null,
+        };
 
-        const totalChunks =
-          uploadType === 'multipart' ? Math.ceil(totalSize / chunkSize) : 1;
+        const { error: dbError } = await supabase
+          .from('uploads')
+          .insert(uploadRecord);
 
-        reply.send({
+        if (dbError) {
+          // Rollback: abort S3 multipart upload if it was initiated
+          if (uploadType === 'multipart' && s3UploadId) {
+            await storageService.abortMultipartUpload(config as any, fileKey, s3UploadId);
+          }
+
+          fastify.log.error('Error creating upload record:', dbError);
+          return reply.status(500).send({
+            error: 'Database error',
+            message: 'Failed to create upload record',
+          });
+        }
+
+        return reply.send({
           uploadId,
-          s3Key: key,
+          s3Key: fileKey,
           uploadType,
-          chunkSize: uploadType === 'multipart' ? chunkSize : totalSize,
+          chunkSize,
           totalChunks,
+          thumbnailUploadUrl,
         });
       } catch (error) {
-        fastify.log.error(error);
-        reply.status(500).send({ error: 'Failed to initiate upload' });
+        fastify.log.error('Error initiating upload:', error);
+        return reply.status(500).send({
+          error: 'Internal server error',
+          message: 'Failed to initiate upload'
+        });
       }
     }
   );
 
-  // Get presigned URL (works for both single and multipart uploads)
-  fastify.post<{ Body: GetUploadUrlRequest; Reply: GetUploadUrlResponse }>(
+  // POST /url - Get presigned URL for upload
+  fastify.post<{
+    Body: {
+      uploadId: string;
+      partNumber: number;
+    };
+  }>(
     '/url',
     {
       schema: {
-        body: GetUploadUrlSchema,
-        response: {
-          200: {
-            type: 'object',
-            properties: {
-              uploadUrl: { type: 'string' },
-              expiresAt: { type: 'string' },
-            },
+        body: {
+          type: 'object',
+          required: ['uploadId', 'partNumber'],
+          properties: {
+            uploadId: { type: 'string' },
+            partNumber: { type: 'number', minimum: 1 },
           },
         },
       },
     },
-    async (
-      request: FastifyRequest<{ Body: GetUploadUrlRequest }>,
-      reply: FastifyReply
-    ) => {
+    async (request, reply) => {
       try {
         const { uploadId, partNumber } = request.body;
         const userId = request.user.id;
 
-        // Get upload record from database
-        const uploadRecord = await uploadDbService.getUploadRecord(
-          uploadId,
-          userId
-        );
-        if (!uploadRecord) {
+        // Get upload record
+        const { data: upload, error: uploadError } = await supabase
+          .from('uploads')
+          .select('*')
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId)
+          .single();
+
+        if (uploadError || !upload) {
           return reply.status(404).send({ error: 'Upload not found' });
         }
 
-        if (uploadRecord.status !== 'active') {
-          return reply.status(400).send({ error: 'Upload is not active' });
+        if (upload.status !== 'active') {
+          return reply.status(400).send({
+            error: 'Invalid upload status',
+            message: `Upload is ${upload.status}, cannot generate URL`
+          });
         }
 
-        let uploadUrl: string;
+        // Get user's storage config
+        const config = upload?.hub_id ? await getHubStorageConfig(upload.hub_id) : null;
+        if (!config) {
+          return reply.status(400).send({ error: 'Storage not configured' });
+        }
 
-        if (uploadRecord.upload_type === 'multipart') {
-          // Multipart upload - generate presigned URL for specific part
-          if (!partNumber) {
-            return reply
-              .status(400)
-              .send({ error: 'Part number required for multipart upload' });
-          }
-          uploadUrl = await s3Service.generatePresignedUploadUrl(
-            uploadRecord.bucket,
-            uploadRecord.s3_key,
-            uploadId,
-            partNumber
+        let urlResult;
+
+        if (upload.upload_type === 'single') {
+          // Single-part upload: generate PUT URL
+          urlResult = await storageService.generatePresignedUploadUrl(
+            config as any,
+            upload.file_key,
+            upload.content_type
           );
         } else {
-          // Single-part upload - generate presigned PUT URL
-          uploadUrl = await s3Service.generatePresignedPutUrl(
-            uploadRecord.bucket,
-            uploadRecord.s3_key,
-            uploadRecord.content_type
+          // Multipart upload: generate part upload URL
+          const partsData = upload.parts as any;
+          const s3UploadId = partsData?.s3UploadId;
+
+          if (!s3UploadId) {
+            return reply.status(500).send({
+              error: 'Invalid upload state',
+              message: 'S3 upload ID not found'
+            });
+          }
+
+          urlResult = await storageService.generatePresignedPartUrl(
+            config as any,
+            upload.file_key,
+            s3UploadId,
+            partNumber
           );
         }
 
-        const expiresAt = new Date();
-        expiresAt.setHours(expiresAt.getHours() + 1); // 1 hour expiry
+        if (!urlResult.success || !urlResult.url) {
+          return reply.status(500).send({
+            error: 'Failed to generate URL',
+            message: urlResult.error || 'Could not generate presigned URL',
+          });
+        }
 
-        reply.send({
-          uploadUrl,
-          expiresAt: expiresAt.toISOString(),
+        return reply.send({
+          uploadUrl: urlResult.url,
+          expiresAt: new Date(Date.now() + (urlResult.expiresIn || 3600) * 1000).toISOString(),
         });
       } catch (error) {
-        fastify.log.error(error);
-        reply.status(500).send({ error: 'Failed to generate upload URL' });
+        fastify.log.error('Error generating upload URL:', error);
+        return reply.status(500).send({ error: 'Failed to generate upload URL' });
       }
     }
   );
 
-  // Confirm part upload completion (multipart only)
-  fastify.post<{ Body: CompletePartRequest }>(
+  // POST /complete-part - Confirm part upload completion
+  fastify.post<{
+    Body: {
+      uploadId: string;
+      partNumber: number;
+      etag: string;
+      size: number;
+    };
+  }>(
     '/complete-part',
     {
       schema: {
-        body: CompletePartSchema,
+        body: {
+          type: 'object',
+          required: ['uploadId', 'partNumber', 'etag', 'size'],
+          properties: {
+            uploadId: { type: 'string' },
+            partNumber: { type: 'number' },
+            etag: { type: 'string' },
+            size: { type: 'number' },
+          },
+        },
       },
     },
-    async (
-      request: FastifyRequest<{ Body: CompletePartRequest }>,
-      reply: FastifyReply
-    ) => {
+    async (request, reply) => {
       try {
         const { uploadId, partNumber, etag, size } = request.body;
         const userId = request.user.id;
 
-        // Get upload record to verify it's multipart
-        const uploadRecord = await uploadDbService.getUploadRecord(
-          uploadId,
-          userId
-        );
-        if (!uploadRecord) {
+        // Get upload record
+        const { data: upload, error: uploadError } = await supabase
+          .from('uploads')
+          .select('*')
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId)
+          .single();
+
+        if (uploadError || !upload) {
           return reply.status(404).send({ error: 'Upload not found' });
         }
 
-        if (uploadRecord.upload_type !== 'multipart') {
-          return reply
-            .status(400)
-            .send({
-              error: 'Part completion only supported for multipart uploads',
-            });
+        // Update parts array with completed part
+        const partsData = (upload.parts as any) || { s3UploadId: '', parts: [] };
+        const existingPartIndex = partsData.parts.findIndex((p: any) => p.partNumber === partNumber);
+
+        if (existingPartIndex >= 0) {
+          // Update existing part
+          partsData.parts[existingPartIndex] = { partNumber, etag, size };
+        } else {
+          // Add new part
+          partsData.parts.push({ partNumber, etag, size });
         }
 
-        // Update part information in database
-        await uploadDbService.updateUploadPart(
-          uploadId,
-          userId,
-          partNumber,
-          etag,
-          size
-        );
+        // Update database
+        const { error: updateError } = await supabase
+          .from('uploads')
+          .update({
+            parts: partsData,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId);
 
-        reply.send({ success: true });
+        if (updateError) {
+          fastify.log.error('Error updating part completion:', updateError);
+          return reply.status(500).send({ error: 'Failed to update part status' });
+        }
+
+        return reply.send({ success: true });
       } catch (error) {
-        fastify.log.error(error);
-        reply.status(500).send({ error: 'Failed to complete part' });
+        fastify.log.error('Error completing part:', error);
+        return reply.status(500).send({ error: 'Failed to complete part' });
       }
     }
   );
 
-  // Complete upload (works for both single and multipart)
-  fastify.post<{ Body: CompleteUploadRequest }>(
+  // POST /complete - Complete upload
+  fastify.post<{
+    Body: {
+      uploadId: string;
+      parts?: Array<{ partNumber: number; etag: string }>;
+    };
+  }>(
     '/complete',
     {
       schema: {
-        body: CompleteUploadSchema,
+        body: {
+          type: 'object',
+          required: ['uploadId'],
+          properties: {
+            uploadId: { type: 'string' },
+            parts: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  partNumber: { type: 'number' },
+                  etag: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
       },
     },
-    async (
-      request: FastifyRequest<{ Body: CompleteUploadRequest }>,
-      reply: FastifyReply
-    ) => {
+    async (request, reply) => {
       try {
-        const { uploadId, parts } = request.body;
+        const { uploadId, parts = [] } = request.body;
         const userId = request.user.id;
 
         // Get upload record
-        const uploadRecord = await uploadDbService.getUploadRecord(
-          uploadId,
-          userId
-        );
-        if (!uploadRecord) {
+        const { data: upload, error: uploadError } = await supabase
+          .from('uploads')
+          .select('*')
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId)
+          .single();
+
+        if (uploadError || !upload) {
           return reply.status(404).send({ error: 'Upload not found' });
         }
 
-        if (uploadRecord.status !== 'active') {
-          return reply.status(400).send({ error: 'Upload is not active' });
+        // Get user's storage config
+        const config = upload?.hub_id ? await getHubStorageConfig(upload.hub_id) : null;
+        if (!config) {
+          return reply.status(400).send({ error: 'Storage not configured' });
         }
 
-        try {
-          if (uploadRecord.upload_type === 'multipart') {
-            // Complete S3 multipart upload
-            if (!parts || parts.length === 0) {
-              return reply
-                .status(400)
-                .send({ error: 'Parts required for multipart upload' });
-            }
+        // For multipart uploads, complete the S3 multipart upload
+        if (upload.upload_type === 'multipart') {
+          const partsData = upload.parts as any;
+          const s3UploadId = partsData?.s3UploadId;
 
-            await s3Service.completeMultipartUpload(
-              uploadRecord.bucket,
-              uploadRecord.s3_key,
-              uploadId,
-              parts.map((part) => ({
-                PartNumber: part.partNumber,
-                ETag: part.etag,
-              }))
-            );
+          if (!s3UploadId) {
+            return reply.status(500).send({ error: 'S3 upload ID not found' });
           }
-          // For single-part uploads, no completion needed - file is already uploaded via presigned URL
 
-          // Mark upload as completed in database
-          await uploadDbService.markUploadCompleted(uploadId, userId);
+          // Use parts from request or from database
+          const partsToComplete = parts.length > 0 ? parts : (partsData?.parts || []);
 
-          reply.send({
-            success: true,
-            s3Key: uploadRecord.s3_key,
-            bucket: uploadRecord.bucket,
-            uploadType: uploadRecord.upload_type,
-          });
+          if (partsToComplete.length === 0) {
+            return reply.status(400).send({
+              error: 'No parts to complete',
+              message: 'Multipart upload has no uploaded parts'
+            });
+          }
 
-          // Trigger background processing (thumbnail generation, virus scan, etc.)
-          fileProcessor.scheduleProcessing(uploadId, userId);
-          
-          fastify.log.info(
-            `Upload completed: ${uploadId} - ${uploadRecord.s3_key} (${uploadRecord.upload_type})`
+          // Convert to S3 format
+          const s3Parts = partsToComplete.map((p: any) => ({
+            PartNumber: p.partNumber,
+            ETag: p.etag,
+          }));
+
+          const completeResult = await storageService.completeMultipartUpload(
+            config as any,
+            upload.file_key,
+            s3UploadId,
+            s3Parts
           );
-        } catch (s3Error) {
-          // Mark upload as failed if S3 completion fails
-          await uploadDbService.markUploadFailed(uploadId, userId);
-          throw s3Error;
+
+          if (!completeResult.success) {
+            return reply.status(500).send({
+              error: 'Failed to complete upload',
+              message: completeResult.error || 'S3 multipart completion failed',
+            });
+          }
         }
+
+        // Update database record to completed
+        const { error: updateError } = await supabase
+          .from('uploads')
+          .update({
+            status: 'completed',
+            completed_at: new Date().toISOString(),
+            final_file_key: upload.file_key,
+            final_bucket_name: upload.bucket_name,
+            file_size_bytes: upload.total_size,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId);
+
+        if (updateError) {
+          fastify.log.error('Error updating upload status:', updateError);
+          return reply.status(500).send({ error: 'Failed to mark upload as completed' });
+        }
+
+        return reply.send({
+          success: true,
+          message: 'Upload completed successfully'
+        });
       } catch (error) {
-        fastify.log.error(error);
-        reply.status(500).send({ error: 'Failed to complete upload' });
+        fastify.log.error('Error completing upload:', error);
+        return reply.status(500).send({ error: 'Failed to complete upload' });
       }
     }
   );
 
-  // Abort upload (works for both single and multipart)
-  fastify.post<{ Body: AbortUploadRequest }>(
+  // POST /abort - Abort upload
+  fastify.post<{
+    Body: {
+      uploadId: string;
+    };
+  }>(
     '/abort',
     {
       schema: {
-        body: AbortUploadSchema,
+        body: {
+          type: 'object',
+          required: ['uploadId'],
+          properties: {
+            uploadId: { type: 'string' },
+          },
+        },
       },
     },
-    async (
-      request: FastifyRequest<{ Body: AbortUploadRequest }>,
-      reply: FastifyReply
-    ) => {
+    async (request, reply) => {
       try {
         const { uploadId } = request.body;
         const userId = request.user.id;
 
         // Get upload record
-        const uploadRecord = await uploadDbService.getUploadRecord(
-          uploadId,
-          userId
-        );
-        if (!uploadRecord) {
+        const { data: upload, error: uploadError } = await supabase
+          .from('uploads')
+          .select('*')
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId)
+          .single();
+
+        if (uploadError || !upload) {
           return reply.status(404).send({ error: 'Upload not found' });
         }
 
-        // Only abort S3 multipart upload if it's actually multipart
-        if (uploadRecord.upload_type === 'multipart') {
-          await s3Service.abortMultipartUpload(
-            uploadRecord.bucket,
-            uploadRecord.s3_key,
-            uploadId
-          );
+        // Get user's storage config
+        const config = upload?.hub_id ? await getHubStorageConfig(upload.hub_id) : null;
+        if (!config) {
+          return reply.status(400).send({ error: 'Storage not configured' });
         }
-        // For single-part uploads, no S3 abort needed
 
-        // Mark upload as aborted in database
-        await uploadDbService.markUploadAborted(uploadId, userId);
+        // For multipart uploads, abort the S3 multipart upload
+        if (upload.upload_type === 'multipart') {
+          const partsData = upload.parts as any;
+          const s3UploadId = partsData?.s3UploadId;
 
-        reply.send({ success: true });
+          if (s3UploadId) {
+            await storageService.abortMultipartUpload(config as any, upload.file_key, s3UploadId);
+          }
+        }
+
+        // Update database record and clean up metadata
+        const { error: deleteError } = await supabase
+          .from('uploads')
+          .delete()
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId);
+
+        if (deleteError) {
+          fastify.log.error('Error deleting upload record:', deleteError);
+          return reply.status(500).send({ error: 'Failed to abort upload' });
+        }
+
+        return reply.send({
+          success: true,
+          message: 'Upload aborted and cleaned up'
+        });
       } catch (error) {
-        fastify.log.error(error);
-        reply.status(500).send({ error: 'Failed to abort upload' });
+        fastify.log.error('Error aborting upload:', error);
+        return reply.status(500).send({ error: 'Failed to abort upload' });
       }
     }
   );
 
-  // Get upload status
+  // GET /status - Get upload status (for resume capability)
   fastify.get<{
-    Querystring: UploadStatusRequest;
-    Reply: UploadStatusResponse;
+    Querystring: {
+      uploadId: string;
+    };
   }>(
     '/status',
     {
       schema: {
-        querystring: UploadStatusSchema,
+        querystring: {
+          type: 'object',
+          required: ['uploadId'],
+          properties: {
+            uploadId: { type: 'string' },
+          },
+        },
       },
     },
-    async (
-      request: FastifyRequest<{ Querystring: UploadStatusRequest }>,
-      reply: FastifyReply
-    ) => {
+    async (request, reply) => {
       try {
         const { uploadId } = request.query;
         const userId = request.user.id;
 
-        // Get upload record from database
-        const uploadRecord = await uploadDbService.getUploadRecord(
-          uploadId,
-          userId
-        );
-        if (!uploadRecord) {
+        // Get upload record
+        const { data: upload, error: uploadError } = await supabase
+          .from('uploads')
+          .select('*')
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId)
+          .single();
+
+        if (uploadError || !upload) {
           return reply.status(404).send({ error: 'Upload not found' });
         }
 
-        // Calculate progress based on upload type
-        let uploadedSize = 0;
-        let totalParts = 1;
+        const partsData = upload.parts as any;
+        const uploadedParts = partsData?.parts || [];
+        const totalParts = upload.upload_type === 'multipart'
+          ? Math.ceil(upload.total_size / (10 * 1024 * 1024))
+          : 1;
 
-        if (uploadRecord.upload_type === 'multipart') {
-          uploadedSize = uploadRecord.parts.reduce(
-            (sum, part) => sum + part.size,
-            0
-          );
-          totalParts = Math.ceil(uploadRecord.total_size / (10 * 1024 * 1024)); // Assuming 10MB chunks
-        } else {
-          // For single-part uploads, it's either 0% or 100%
-          uploadedSize =
-            uploadRecord.status === 'completed' ? uploadRecord.total_size : 0;
-          totalParts = 1;
-        }
-
-        const progress =
-          uploadRecord.total_size > 0
-            ? (uploadedSize / uploadRecord.total_size) * 100
-            : 0;
-
-        reply.send({
-          uploadId,
-          status: uploadRecord.status,
-          uploadType: uploadRecord.upload_type,
-          uploadedParts: uploadRecord.parts,
+        return reply.send({
+          uploadId: upload.upload_id,
+          status: upload.status,
+          uploadType: upload.upload_type,
+          uploadedParts,
           totalParts,
-          uploadedSize,
-          totalSize: uploadRecord.total_size,
-          progress: Math.round(progress * 100) / 100, // Round to 2 decimal places
+          filename: upload.filename,
+          totalSize: upload.total_size,
+          createdAt: upload.created_at,
         });
       } catch (error) {
-        fastify.log.error(error);
-        reply.status(500).send({ error: 'Failed to get upload status' });
+        fastify.log.error('Error getting upload status:', error);
+        return reply.status(500).send({ error: 'Failed to get upload status' });
       }
     }
   );
 
-  // List active uploads for user
-  fastify.get(
-    '/active',
-    async (request: FastifyRequest, reply: FastifyReply) => {
+  // POST /mark-failed - Mark upload as failed (keeps record for debugging)
+  fastify.post<{
+    Body: {
+      uploadId: string;
+      error?: string;
+    };
+  }>(
+    '/mark-failed',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          required: ['uploadId'],
+          properties: {
+            uploadId: { type: 'string' },
+            error: { type: 'string' },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
       try {
-        const { id: userId } = request.user;
-        const activeUploads = await uploadDbService.getActiveUploads(userId);
+        const { uploadId, error: errorMessage } = request.body;
+        const userId = request.user.id;
 
-        const uploadsWithProgress = activeUploads.map((upload) => {
-          const uploadedSize = upload.parts.reduce(
-            (sum, part) => sum + part.size,
-            0
-          );
-          const progress =
-            upload.total_size > 0
-              ? (uploadedSize / upload.total_size) * 100
-              : 0;
+        // Get upload record
+        const { data: upload, error: uploadError } = await supabase
+          .from('uploads')
+          .select('*')
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId)
+          .single();
 
-          return {
-            uploadId: upload.upload_id,
-            filename: upload.filename,
-            contentType: upload.content_type,
-            totalSize: upload.total_size,
-            uploadedSize,
-            progress: Math.round(progress * 100) / 100,
-            createdAt: upload.created_at,
-            updatedAt: upload.updated_at,
-          };
+        if (uploadError || !upload) {
+          return reply.status(404).send({ error: 'Upload not found' });
+        }
+
+        // Get user's storage config
+        const config = upload?.hub_id ? await getHubStorageConfig(upload.hub_id) : null;
+        if (config) {
+          // For multipart uploads, abort the S3 multipart upload
+          if (upload.upload_type === 'multipart') {
+            const partsData = upload.parts as any;
+            const s3UploadId = partsData?.s3UploadId;
+
+            if (s3UploadId) {
+              await storageService.abortMultipartUpload(config as any, upload.file_key, s3UploadId);
+            }
+          }
+        }
+
+        // Mark as failed in database (keeps record for debugging)
+        const { error: updateError } = await supabase
+          .from('uploads')
+          .update({
+            status: 'failed',
+            processing_status: 'failed',
+            processing_message: errorMessage || 'Upload failed',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('upload_id', uploadId)
+          .eq('user_id', userId);
+
+        if (updateError) {
+          fastify.log.error('Error marking upload as failed:', updateError);
+          return reply.status(500).send({ error: 'Failed to mark upload as failed' });
+        }
+
+        return reply.send({
+          success: true,
+          message: 'Upload marked as failed'
         });
+      } catch (error) {
+        fastify.log.error('Error marking upload as failed:', error);
+        return reply.status(500).send({ error: 'Failed to mark upload as failed' });
+      }
+    }
+  );
 
-        reply.send({ uploads: uploadsWithProgress });
+  // GET /active - List active uploads
+  fastify.get('/active', async (request, reply) => {
+    try {
+      const userId = request.user.id;
+
+      const { data: uploads, error } = await supabase
+        .from('uploads')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        fastify.log.error('Error fetching active uploads:', error);
+        return reply.status(500).send({ error: 'Failed to fetch active uploads' });
+      }
+
+      return reply.send({ uploads: uploads || [] });
+    } catch (error) {
+      fastify.log.error('Error listing active uploads:', error);
+      return reply.status(500).send({ error: 'Failed to list active uploads' });
+    }
+  });
+
+  // PATCH /:upload_id - Update file metadata (title, description, tags)
+  fastify.patch<{
+    Params: { upload_id: string };
+    Body: { title?: string; description?: string; tags?: string[] };
+  }>(
+    '/:upload_id',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            description: { type: 'string' },
+            tags: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const { upload_id } = request.params;
+        const { title, description, tags } = request.body;
+        const userId = request.user.id;
+
+        // Verify file exists and user owns it
+        const { data: upload, error: fetchError } = await supabase
+          .from('uploads')
+          .select('*')
+          .eq('upload_id', upload_id)
+          .eq('user_id', userId)
+          .single();
+
+        if (fetchError || !upload) {
+          return reply.status(404).send({ error: 'File not found' });
+        }
+
+        // Build update object with only provided fields
+        const updateData: any = {
+          updated_at: new Date().toISOString(),
+        };
+
+        // Update filename if title is provided (keep extension)
+        if (title !== undefined) {
+          const extension = upload.filename.substring(upload.filename.lastIndexOf('.'));
+          updateData.filename = title + extension;
+        }
+
+        // Update description if provided
+        if (description !== undefined) {
+          updateData.description = description;
+        }
+
+        // Update tags if provided
+        if (tags !== undefined) {
+          updateData.tags = tags;
+        }
+
+        // Update the file metadata
+        fastify.log.info(`Updating file metadata for upload_id: ${upload_id}`, updateData);
+
+        const { data: updated, error: updateError } = await supabase
+          .from('uploads')
+          .update(updateData)
+          .eq('upload_id', upload_id)
+          .eq('user_id', userId)
+          .select()
+          .single();
+
+        if (updateError) {
+          fastify.log.error('Update error:', updateError);
+          return reply.status(500).send({ error: updateError.message });
+        }
+
+        fastify.log.info('File metadata updated successfully:', updated);
+        reply.send({ success: true, file: updated });
       } catch (error) {
         fastify.log.error(error);
-        reply.status(500).send({ error: 'Failed to get active uploads' });
+        reply.status(500).send({ error: 'Failed to update file metadata' });
+      }
+    }
+  );
+
+  // POST /:upload_id/move - Move file to different folder
+  fastify.post<{
+    Params: { upload_id: string };
+    Body: { folder_id: string | null };
+  }>(
+    '/:upload_id/move',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          required: ['folder_id'],
+          properties: {
+            folder_id: { type: ['string', 'null'] },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const { upload_id } = request.params;
+        const { folder_id } = request.body;
+        const userId = request.user.id;
+
+        // Verify file exists and user owns it
+        const { data: file, error: fileError } = await supabase
+          .from('uploads')
+          .select('*')
+          .eq('upload_id', upload_id)
+          .eq('user_id', userId)
+          .single();
+
+        if (fileError || !file) {
+          return reply.status(404).send({ error: 'File not found' });
+        }
+
+        // If moving to a folder, verify it exists and is owned by user
+        if (folder_id) {
+          const { data: folder, error: folderError } = await supabase
+            .from('folders')
+            .select('id')
+            .eq('id', folder_id)
+            .eq('owner_id', userId)
+            .single();
+
+          if (folderError || !folder) {
+            return reply.status(400).send({ error: 'Target folder not found' });
+          }
+        }
+
+        const { data, error } = await supabase
+          .from('uploads')
+          .update({ folder_id })
+          .eq('upload_id', upload_id)
+          .eq('user_id', userId)
+          .select()
+          .single();
+
+        if (error) {
+          return reply.status(500).send({ error: error.message });
+        }
+
+        reply.send({ file: data });
+      } catch (error) {
+        fastify.log.error(error);
+        reply.status(500).send({ error: 'Failed to move file' });
+      }
+    }
+  );
+
+  // DELETE /bulk - Delete multiple files
+  fastify.delete<{
+    Body: { fileIds: string[] };
+  }>(
+    '/bulk',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          required: ['fileIds'],
+          properties: {
+            fileIds: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const { fileIds } = request.body;
+        const userId = request.user.id;
+
+        if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
+          return reply.status(400).send({ error: 'fileIds array is required' });
+        }
+
+        // Verify all files exist and user owns them
+        const { data: uploads, error: fetchError } = await supabase
+          .from('uploads')
+          .select('*')
+          .in('upload_id', fileIds);
+
+        if (fetchError) {
+          fastify.log.error('Error fetching uploads:', fetchError);
+          return reply.status(500).send({ error: 'Failed to fetch files' });
+        }
+
+        if (!uploads || uploads.length === 0) {
+          return reply.status(404).send({ error: 'No files found' });
+        }
+
+        // Check permissions - user must own the file to delete it
+        const allowedUploads = uploads.filter((upload: any) => upload.user_id === userId);
+
+        if (allowedUploads.length === 0) {
+          return reply.status(403).send({ error: 'Access denied - you can only delete your own files' });
+        }
+
+        // Delete files from S3 storage first
+        const config = uploads[0]?.hub_id ? await getHubStorageConfig(uploads[0].hub_id) : null;
+
+        if (config) {
+          // Collect all S3 keys to delete (files + thumbnails)
+          const keysToDelete: string[] = [];
+
+          allowedUploads.forEach((upload: any) => {
+            if (upload.file_key) {
+              keysToDelete.push(upload.file_key);
+            }
+          });
+
+          if (keysToDelete.length > 0) {
+            // Delete from S3 in batch
+            const deleteResult = await storageService.deleteObjects(config as any, keysToDelete);
+
+            if (!deleteResult.success) {
+              fastify.log.error('Failed to delete some files from S3:', deleteResult.error);
+              // Continue with database deletion even if S3 deletion partially fails
+              if (deleteResult.failed.length > 0) {
+                fastify.log.error('Failed S3 keys:', deleteResult.failed);
+              }
+            } else {
+              fastify.log.info(`Successfully deleted ${deleteResult.deleted.length} objects from S3`);
+            }
+          }
+        } else {
+          fastify.log.warn(
+            'User has no storage config - skipping S3 deletion (orphaned objects may remain)'
+          );
+        }
+
+        // Delete from database
+        const { error: deleteError } = await supabase
+          .from('uploads')
+          .delete()
+          .in('id', allowedUploads.map((upload: any) => upload.id));
+
+        if (deleteError) {
+          fastify.log.error('Error deleting from database:', deleteError);
+          return reply.status(500).send({ error: 'Failed to delete files from database' });
+        }
+
+        reply.send({
+          success: true,
+          deletedCount: allowedUploads.length,
+          message: `Successfully deleted ${allowedUploads.length} files`,
+        });
+      } catch (error) {
+        fastify.log.error('File deletion error:', error);
+        reply.status(500).send({ error: 'Failed to delete files' });
       }
     }
   );

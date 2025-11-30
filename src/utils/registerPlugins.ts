@@ -8,6 +8,9 @@ import folderRoutes from '@/routes/folders';
 import signedUrlRoutes from '@/routes/signed-urls';
 import uploadStatusRoutes from '@/routes/upload-status';
 import profileRoutes from '@/routes/profile';
+import hubRoutes from '@/routes/hubs';
+import sharingRoutes from '@/routes/sharing';
+import storageRoutes from '@/routes/storage';
 
 export default async function registerPlugins<T extends RawServerBase>(
   fastify: FastifyInstance<T>
@@ -55,4 +58,7 @@ export default async function registerPlugins<T extends RawServerBase>(
   await fastify.register(signedUrlRoutes, { prefix: '/api/v1/signed-urls' });
   await fastify.register(uploadStatusRoutes);
   await fastify.register(profileRoutes, { prefix: '/api/v1/profile' });
+  await fastify.register(hubRoutes, { prefix: '/api/v1/hubs' });
+  await fastify.register(sharingRoutes, { prefix: '/api/v1/sharing' });
+  await fastify.register(storageRoutes, { prefix: '/api/v1/storage' });
 }

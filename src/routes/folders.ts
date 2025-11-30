@@ -1,7 +1,8 @@
 // src/routes/folders.ts
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { supabase } from '@/services/supabase';
-import { S3UploadService } from '@/services/s3Upload';
+import { StorageService } from '@/services/storageService';
+import { getHubStorageConfig } from '@/services/hubStorageConfigService';
 
 // Types for request/response
 interface CreateFolderRequest {
@@ -27,15 +28,18 @@ interface MoveFileRequest {
 interface FolderContentsQuery {
   folder_id?: string;
   include_files?: 'true' | 'false';
-  sort?: 'name' | 'created_at' | 'updated_at';
+  sort?: 'name' | 'created_at' | 'updated_at' | 'type' | 'size';
   order?: 'asc' | 'desc';
   page?: string;
   limit?: string;
   cursor?: string; // For cursor-based pagination on large datasets
+  search?: string; // Search query for filenames, descriptions, and tags
 }
 
 export default async function folderRoutes(fastify: FastifyInstance) {
-  const s3Service = new S3UploadService();
+  const storageService = new StorageService();
+  
+
   // Ensure user is authenticated for all routes
   fastify.addHook('preHandler', async (request, reply) => {
     try {
@@ -109,6 +113,7 @@ export default async function folderRoutes(fastify: FastifyInstance) {
         page = '1',
         limit = '50',
         cursor,
+        search,
       } = request.query;
       
       // Parse pagination parameters
@@ -143,13 +148,21 @@ export default async function folderRoutes(fastify: FastifyInstance) {
         return reply.status(500).send({ error: countError1.message });
       }
 
+      // Map sort parameter to folder column (folders don't have content_type or total_size)
+      let folderSortColumn = 'name';
+      if (sort === 'created_at' || sort === 'updated_at') {
+        folderSortColumn = sort;
+      } else {
+        folderSortColumn = 'name'; // Default to name for type/size sorting
+      }
+
       // Get paginated subfolders
       const { data: subfolders, error: subfoldersError } = await supabase
         .from('folders')
         .select('*')
         .eq('parent_id', id)
         .eq('owner_id', userId)
-        .order(sort, { ascending: order === 'asc' })
+        .order(folderSortColumn, { ascending: order === 'asc' })
         .range(offset, offset + limitNum - 1);
 
       if (subfoldersError) {
@@ -158,15 +171,40 @@ export default async function folderRoutes(fastify: FastifyInstance) {
 
       let files: any[] = [];
       let filesCount = 0;
-      
+
       if (include_files === 'true') {
-        // Get total count of files for pagination metadata
-        const { count: fileCountResult, error: countError2 } = await supabase
+        // Build the base query for files
+        let countQuery = supabase
           .from('uploads')
           .select('*', { count: 'exact', head: true })
           .eq('folder_id', id)
           .eq('user_id', userId)
           .eq('status', 'completed');
+
+        let filesQuery = supabase
+          .from('uploads')
+          .select('*')
+          .eq('folder_id', id)
+          .eq('user_id', userId)
+          .eq('status', 'completed');
+
+        // Apply search filter if provided
+        if (search && search.trim()) {
+          const searchTerm = search.trim().toLowerCase();
+
+          // For count query: search in filename, description, or tags
+          countQuery = countQuery.or(
+            `filename.ilike.%${searchTerm}%,description.ilike.%${searchTerm}%,tags.cs.{${searchTerm}}`
+          );
+
+          // For data query: search in filename, description, or tags
+          filesQuery = filesQuery.or(
+            `filename.ilike.%${searchTerm}%,description.ilike.%${searchTerm}%,tags.cs.{${searchTerm}}`
+          );
+        }
+
+        // Get total count of files for pagination metadata
+        const { count: fileCountResult, error: countError2 } = await countQuery;
 
         if (countError2) {
           return reply.status(500).send({ error: countError2.message });
@@ -174,15 +212,23 @@ export default async function folderRoutes(fastify: FastifyInstance) {
 
         filesCount = fileCountResult || 0;
 
+        // Map sort parameter to database column
+        let sortColumn = 'filename';
+        if (sort === 'created_at' || sort === 'updated_at') {
+          sortColumn = sort;
+        } else if (sort === 'name') {
+          sortColumn = 'filename';
+        } else if (sort === 'type') {
+          sortColumn = 'content_type';
+        } else if (sort === 'size') {
+          sortColumn = 'total_size';
+        }
+
+        fastify.log.info(`Sorting files by ${sortColumn}, order: ${order} (from sort=${sort})${search ? `, search: ${search}` : ''}`);
+
         // Get paginated files in this folder
-        const { data: filesData, error: filesError } = await supabase
-          .from('uploads')
-          .select('*')
-          .eq('folder_id', id)
-          .eq('user_id', userId)
-          .eq('status', 'completed')  // Only show completed uploads
-          .order('sort_order')
-          .order('filename')
+        const { data: filesData, error: filesError } = await filesQuery
+          .order(sortColumn, { ascending: order === 'asc' })
           .range(offset, offset + limitNum - 1);
 
         if (filesError) {
@@ -195,18 +241,18 @@ export default async function folderRoutes(fastify: FastifyInstance) {
           assetId: upload.id,
           publicId: upload.upload_id,
           title: upload.filename.replace(/\.[^/.]+$/, ''), // Remove extension for title
-          description: '',
-          tags: [],
+          description: upload.description || '',
+          tags: upload.tags || [],
           format: upload.content_type?.split('/')[1] || 'unknown',
+          mimeType: upload.content_type || 'application/octet-stream', // Include full MIME type
           width: 800, // Default width - should be extracted from metadata
-          height: 600, // Default height - should be extracted from metadata  
-          // No direct URLs - frontend will fetch signed URLs
+          height: 600, // Default height - should be extracted from metadata
+          // No direct URLs - frontend will request file access through API
           uploadedAt: upload.created_at,
           createdAt: upload.created_at,
           updatedAt: upload.updated_at,
           folder_id: upload.folder_id,
-          // Include metadata for signed URL generation
-          hasThumbnail: !!upload.thumbnail_s3_key,
+          // Include metadata for file access
         }));
       }
 
@@ -239,6 +285,104 @@ export default async function folderRoutes(fastify: FastifyInstance) {
     }
   });
 
+  // GET /folders/:id/file-ids - Get all file IDs in a folder (lightweight, no full data)
+  fastify.get<{
+    Params: { id: string };
+    Querystring: { search?: string };
+  }>('/:id/file-ids', async (request, reply) => {
+    try {
+      const { id } = request.params;
+      const { search } = request.query;
+      const userId = request.user.id;
+
+      // Verify user owns or has access to the folder
+      const { data: folder, error: folderError } = await supabase
+        .from('folders')
+        .select('id')
+        .eq('id', id)
+        .eq('owner_id', userId)
+        .single();
+
+      if (folderError) {
+        if (folderError.code === 'PGRST116') {
+          return reply.status(404).send({ error: 'Folder not found' });
+        }
+        return reply.status(500).send({ error: folderError.message });
+      }
+
+      // Build query for file IDs
+      let filesQuery = supabase
+        .from('uploads')
+        .select('upload_id')
+        .eq('folder_id', id)
+        .eq('user_id', userId)
+        .eq('status', 'completed');
+
+      // Apply search filter if provided
+      if (search && search.trim()) {
+        const searchTerm = search.trim().toLowerCase();
+        filesQuery = filesQuery.or(
+          `filename.ilike.%${searchTerm}%,description.ilike.%${searchTerm}%,tags.cs.{${searchTerm}}`
+        );
+      }
+
+      // Fetch all file IDs (no pagination, just IDs)
+      const { data: files, error: filesError } = await filesQuery;
+
+      if (filesError) {
+        return reply.status(500).send({ error: filesError.message });
+      }
+
+      // Return just the IDs array
+      const fileIds = (files || []).map(file => file.upload_id);
+      reply.send({ fileIds });
+    } catch (error) {
+      fastify.log.error(error);
+      reply.status(500).send({ error: 'Failed to fetch file IDs' });
+    }
+  });
+
+  // GET /folders/root/file-ids - Get all file IDs in root (lightweight, no full data)
+  fastify.get<{ Querystring: { search?: string } }>(
+    '/root/file-ids',
+    async (request, reply) => {
+      try {
+        const { search } = request.query;
+        const userId = request.user.id;
+
+        // Build query for root file IDs
+        let filesQuery = supabase
+          .from('uploads')
+          .select('upload_id')
+          .is('folder_id', null)
+          .eq('user_id', userId)
+          .eq('status', 'completed');
+
+        // Apply search filter if provided
+        if (search && search.trim()) {
+          const searchTerm = search.trim().toLowerCase();
+          filesQuery = filesQuery.or(
+            `filename.ilike.%${searchTerm}%,description.ilike.%${searchTerm}%,tags.cs.{${searchTerm}}`
+          );
+        }
+
+        // Fetch all file IDs (no pagination, just IDs)
+        const { data: files, error: filesError } = await filesQuery;
+
+        if (filesError) {
+          return reply.status(500).send({ error: filesError.message });
+        }
+
+        // Return just the IDs array
+        const fileIds = (files || []).map(file => file.upload_id);
+        reply.send({ fileIds });
+      } catch (error) {
+        fastify.log.error(error);
+        reply.status(500).send({ error: 'Failed to fetch file IDs' });
+      }
+    }
+  );
+
   // GET /folders/root/contents - Get root contents (folders and files not in any folder)
   fastify.get<{ Querystring: FolderContentsQuery }>(
     '/root/contents',
@@ -251,6 +395,7 @@ export default async function folderRoutes(fastify: FastifyInstance) {
           page = '1',
           limit = '50',
           cursor,
+          search,
         } = request.query;
         
         // Parse pagination parameters
@@ -270,13 +415,21 @@ export default async function folderRoutes(fastify: FastifyInstance) {
           return reply.status(500).send({ error: countError1.message });
         }
 
+        // Map sort parameter to folder column (folders don't have content_type or total_size)
+        let folderSortColumn = 'name';
+        if (sort === 'created_at' || sort === 'updated_at') {
+          folderSortColumn = sort;
+        } else {
+          folderSortColumn = 'name'; // Default to name for type/size sorting
+        }
+
         // Get paginated root folders (no parent)
         const { data: folders, error: foldersError } = await supabase
           .from('folders')
           .select('*')
           .is('parent_id', null)
           .eq('owner_id', userId)
-          .order(sort, { ascending: order === 'asc' })
+          .order(folderSortColumn, { ascending: order === 'asc' })
           .range(offset, offset + limitNum - 1);
 
         if (foldersError) {
@@ -287,13 +440,38 @@ export default async function folderRoutes(fastify: FastifyInstance) {
         let filesCount = 0;
 
         if (include_files === 'true') {
-          // Get total count of root files
-          const { count: fileCountResult, error: countError2 } = await supabase
+          // Build the base query for root files
+          let countQuery = supabase
             .from('uploads')
             .select('*', { count: 'exact', head: true })
             .is('folder_id', null)
             .eq('user_id', userId)
             .eq('status', 'completed');
+
+          let filesQuery = supabase
+            .from('uploads')
+            .select('*')
+            .is('folder_id', null)
+            .eq('user_id', userId)
+            .eq('status', 'completed');
+
+          // Apply search filter if provided
+          if (search && search.trim()) {
+            const searchTerm = search.trim().toLowerCase();
+
+            // For count query: search in filename, description, or tags
+            countQuery = countQuery.or(
+              `filename.ilike.%${searchTerm}%,description.ilike.%${searchTerm}%,tags.cs.{${searchTerm}}`
+            );
+
+            // For data query: search in filename, description, or tags
+            filesQuery = filesQuery.or(
+              `filename.ilike.%${searchTerm}%,description.ilike.%${searchTerm}%,tags.cs.{${searchTerm}}`
+            );
+          }
+
+          // Get total count of root files
+          const { count: fileCountResult, error: countError2 } = await countQuery;
 
           if (countError2) {
             return reply.status(500).send({ error: countError2.message });
@@ -301,15 +479,23 @@ export default async function folderRoutes(fastify: FastifyInstance) {
 
           filesCount = fileCountResult || 0;
 
+          // Map sort parameter to database column
+          let sortColumn = 'filename';
+          if (sort === 'created_at' || sort === 'updated_at') {
+            sortColumn = sort;
+          } else if (sort === 'name') {
+            sortColumn = 'filename';
+          } else if (sort === 'type') {
+            sortColumn = 'content_type';
+          } else if (sort === 'size') {
+            sortColumn = 'total_size';
+          }
+
+          fastify.log.info(`Sorting root files by ${sortColumn}, order: ${order} (from sort=${sort})${search ? `, search: ${search}` : ''}`);
+
           // Get paginated files not in any folder
-          const { data: filesData, error: filesError } = await supabase
-            .from('uploads')
-            .select('*')
-            .is('folder_id', null)
-            .eq('user_id', userId)
-            .eq('status', 'completed')  // Only show completed uploads
-            .order('sort_order')
-            .order('filename')
+          const { data: filesData, error: filesError } = await filesQuery
+            .order(sortColumn, { ascending: order === 'asc' })
             .range(offset, offset + limitNum - 1);
 
           if (filesError) {
@@ -322,13 +508,14 @@ export default async function folderRoutes(fastify: FastifyInstance) {
             assetId: upload.id,
             publicId: upload.upload_id,
             title: upload.filename.replace(/\.[^/.]+$/, ''), // Remove extension for title
-            description: '',
-            tags: [],
+            description: upload.description || '',
+            tags: upload.tags || [],
             format: upload.content_type?.split('/')[1] || 'unknown',
+            mimeType: upload.content_type || 'application/octet-stream', // Include full MIME type
             width: 800, // Default width - should be extracted from metadata
-            height: 600, // Default height - should be extracted from metadata  
-            url: upload.thumbnail_url || `${process.env.AWS_ENDPOINT_URL}/${upload.final_bucket || upload.bucket}/${upload.final_s3_key || upload.s3_key}`,
-            thumbnailUrl: upload.thumbnail_url,
+            height: 600, // Default height - should be extracted from metadata
+            // TODO: File URLs will be generated when storage is configured
+            thumbnailUrl: null, // Will be generated when storage is configured
             uploadedAt: upload.created_at,
             createdAt: upload.created_at,
             updatedAt: upload.updated_at,
@@ -778,51 +965,52 @@ export default async function folderRoutes(fastify: FastifyInstance) {
       // Get all files in these folders (including subfolders)
       const { data: uploads, error: uploadsError } = await supabase
         .from('uploads')
-        .select('id, upload_id, s3_key, final_s3_key, bucket, final_bucket, thumbnail_s3_key')
+        .select('*')
         .in('folder_id', allFolderIds)
         .eq('user_id', userId);
 
       if (uploadsError) {
-        return reply.status(500).send({ error: `Failed to fetch uploads: ${uploadsError.message}` });
+        return reply.status(500).send({
+          error: `Failed to fetch uploads: ${uploadsError.message}`,
+        });
       }
 
-      // Delete files from S3 first (both originals and thumbnails)
+      // Delete files from S3 storage first, then database
       if (uploads && uploads.length > 0) {
-        const s3DeletePromises = uploads.flatMap((upload: any) => {
-          const promises = [];
-          
-          // Delete original file from final bucket if exists
-          if (upload.final_s3_key && upload.final_bucket) {
-            promises.push(
-              s3Service.deleteObject(upload.final_bucket, upload.final_s3_key).catch((err: any) => {
-                fastify.log.warn(`Failed to delete final S3 object ${upload.final_s3_key}:`, err);
-              })
-            );
-          }
-          
-          // Delete original file from temp bucket if exists
-          if (upload.s3_key && upload.bucket) {
-            promises.push(
-              s3Service.deleteObject(upload.bucket, upload.s3_key).catch((err: any) => {
-                fastify.log.warn(`Failed to delete temp S3 object ${upload.s3_key}:`, err);
-              })
-            );
-          }
+        // Get folder's hub storage configuration
+        const config = folder.hub_id ? await getHubStorageConfig(folder.hub_id) : null;
 
-          // Delete thumbnail if exists
-          if (upload.thumbnail_s3_key && upload.final_bucket) {
-            promises.push(
-              s3Service.deleteObject(upload.final_bucket, upload.thumbnail_s3_key).catch((err: any) => {
-                fastify.log.warn(`Failed to delete thumbnail S3 object ${upload.thumbnail_s3_key}:`, err);
-              })
-            );
-          }
-          
-          return promises;
-        });
+        if (config) {
+          // Collect all S3 keys to delete (files + thumbnails)
+          const keysToDelete: string[] = [];
 
-        // Execute all S3 deletions in parallel
-        await Promise.all(s3DeletePromises);
+          uploads.forEach((upload: any) => {
+            if (upload.file_key) {
+              keysToDelete.push(upload.file_key);
+            }
+          });
+
+          if (keysToDelete.length > 0) {
+            // Delete from S3 in batch
+            const deleteResult = await storageService.deleteObjects(config as any, keysToDelete);
+
+            if (!deleteResult.success) {
+              fastify.log.error('Failed to delete some files from S3:', deleteResult.error);
+              // Continue with database deletion even if S3 deletion partially fails
+              if (deleteResult.failed.length > 0) {
+                fastify.log.error('Failed S3 keys:', deleteResult.failed);
+              }
+            } else {
+              fastify.log.info(
+                `Successfully deleted ${deleteResult.deleted.length} objects from S3`
+              );
+            }
+          }
+        } else {
+          fastify.log.warn(
+            'User has no storage config - skipping S3 deletion (orphaned objects may remain)'
+          );
+        }
 
         // Delete uploads from database
         const { error: deleteUploadsError } = await supabase
@@ -860,9 +1048,87 @@ export default async function folderRoutes(fastify: FastifyInstance) {
     }
   });
 
+  // PATCH /files/:upload_id - Update file metadata (title, description, tags)
+  fastify.patch<{
+    Params: { upload_id: string };
+    Body: { title?: string; description?: string; tags?: string[] };
+  }>(
+    '/files/:upload_id',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            description: { type: 'string' },
+            tags: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const { upload_id } = request.params;
+        const { title, description, tags } = request.body;
+        const userId = request.user.id;
+
+        // Verify file exists and user owns it
+        const { data: upload, error: fetchError } = await supabase
+          .from('uploads')
+          .select('*')
+          .eq('upload_id', upload_id)
+          .eq('user_id', userId)
+          .single();
+
+        if (fetchError || !upload) {
+          return reply.status(404).send({ error: 'File not found' });
+        }
+
+        // Build update object with only provided fields
+        const updateData: any = {
+          updated_at: new Date().toISOString(),
+        };
+
+        // Update filename if title is provided (keep extension)
+        if (title !== undefined) {
+          const extension = upload.filename.substring(upload.filename.lastIndexOf('.'));
+          updateData.filename = title + extension;
+        }
+
+        // Update description if provided
+        if (description !== undefined) {
+          updateData.description = description;
+        }
+
+        // Update tags if provided
+        if (tags !== undefined) {
+          updateData.tags = tags;
+        }
+
+        // Update the file metadata
+        const { data: updated, error: updateError } = await supabase
+          .from('uploads')
+          .update(updateData)
+          .eq('upload_id', upload_id)
+          .eq('user_id', userId)
+          .select()
+          .single();
+
+        if (updateError) {
+          return reply.status(500).send({ error: updateError.message });
+        }
+
+        reply.send({ success: true, file: updated });
+      } catch (error) {
+        fastify.log.error(error);
+        reply.status(500).send({ error: 'Failed to update file metadata' });
+      }
+    }
+  );
+
   // DELETE /files - Delete multiple files
-  fastify.delete<{ 
-    Body: { fileIds: string[] } 
+  fastify.delete<{
+    Body: { fileIds: string[] }
   }>('/files', async (request, reply) => {
     try {
       const { fileIds } = request.body;
@@ -872,23 +1138,10 @@ export default async function folderRoutes(fastify: FastifyInstance) {
         return reply.status(400).send({ error: 'fileIds array is required' });
       }
 
-      // Verify all files exist and user owns them (or has access through folder sharing)
+      // Verify all files exist and user owns them
       const { data: uploads, error: fetchError } = await supabase
         .from('uploads')
-        .select(`
-          id,
-          upload_id,
-          user_id,
-          s3_key,
-          final_s3_key,
-          bucket,
-          final_bucket,
-          folder_id,
-          folders(
-            owner_id,
-            folder_shares(shared_with, shared_by, expires_at)
-          )
-        `)
+        .select('*')
         .in('upload_id', fileIds);
 
       if (fetchError) {
@@ -900,54 +1153,47 @@ export default async function folderRoutes(fastify: FastifyInstance) {
         return reply.status(404).send({ error: 'No files found' });
       }
 
-      // Check permissions for each file
-      const allowedUploads = uploads.filter((upload: any) => {
-        // User owns the file directly
-        if (upload.user_id === userId) return true;
-        
-        // User owns the folder containing the file
-        if (upload.folder_id && upload.folders && upload.folders.owner_id === userId) return true;
-        
-        // User has access through folder sharing
-        if (upload.folders?.folder_shares?.some((share: any) => 
-          (share.shared_with === userId || share.shared_with === null) && 
-          (!share.expires_at || new Date(share.expires_at) > new Date())
-        )) return true;
-
-        return false;
-      });
+      // Check permissions - user must own the file to delete it
+      const allowedUploads = uploads.filter((upload: any) => upload.user_id === userId);
 
       if (allowedUploads.length === 0) {
-        return reply.status(403).send({ error: 'Access denied to all files' });
+        return reply.status(403).send({ error: 'Access denied - you can only delete your own files' });
       }
 
-      // Delete files from S3 (both temp and final buckets if they exist)
-      const s3DeletePromises = allowedUploads.flatMap((upload: any) => {
-        const promises = [];
-        
-        // Delete from final bucket if exists
-        if (upload.final_s3_key && upload.final_bucket) {
-          promises.push(
-            s3Service.deleteObject(upload.final_bucket, upload.final_s3_key).catch((err: any) => {
-              fastify.log.warn(`Failed to delete final S3 object ${upload.final_s3_key}:`, err);
-            })
-          );
-        }
-        
-        // Delete from temp bucket if exists
-        if (upload.s3_key && upload.bucket) {
-          promises.push(
-            s3Service.deleteObject(upload.bucket, upload.s3_key).catch((err: any) => {
-              fastify.log.warn(`Failed to delete temp S3 object ${upload.s3_key}:`, err);
-            })
-          );
-        }
-        
-        return promises;
-      });
+      // Delete files from S3 storage first
+      // Get hub storage config from first upload (assuming all files are in same hub)
+      const hubId = allowedUploads[0]?.hub_id;
+      const config = hubId ? await getHubStorageConfig(hubId) : null;
 
-      // Execute all S3 deletions in parallel
-      await Promise.all(s3DeletePromises);
+      if (config) {
+        // Collect all S3 keys to delete (files + thumbnails)
+        const keysToDelete: string[] = [];
+
+        allowedUploads.forEach((upload: any) => {
+          if (upload.file_key) {
+            keysToDelete.push(upload.file_key);
+          }
+        });
+
+        if (keysToDelete.length > 0) {
+          // Delete from S3 in batch
+          const deleteResult = await storageService.deleteObjects(config as any, keysToDelete);
+
+          if (!deleteResult.success) {
+            fastify.log.error('Failed to delete some files from S3:', deleteResult.error);
+            // Continue with database deletion even if S3 deletion partially fails
+            if (deleteResult.failed.length > 0) {
+              fastify.log.error('Failed S3 keys:', deleteResult.failed);
+            }
+          } else {
+            fastify.log.info(`Successfully deleted ${deleteResult.deleted.length} objects from S3`);
+          }
+        }
+      } else {
+        fastify.log.warn(
+          'User has no storage config - skipping S3 deletion (orphaned objects may remain)'
+        );
+      }
 
       // Delete from database
       const { error: deleteError } = await supabase
